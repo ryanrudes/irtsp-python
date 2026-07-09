@@ -43,10 +43,10 @@ def main() -> int:
         drift = abs(anchor.to_unix(anchor.host_anchor) - anchor.wall_anchor)
         (ok if drift < 1e-9 else bad)(f"clock anchor self-consistent (drift {drift:.2e}s)")
 
-        wall_skew = abs(anchor.wall_anchor - time.time())
-        (ok if wall_skew < 3600 else bad)(
-            f"phone wall clock within {wall_skew:.1f}s of this machine"
-        )
+        # wall_anchor is captured when the PHONE starts streaming — its age is
+        # session uptime, not clock skew. (Real skew is measured below, from
+        # live record receipt times.)
+        print(f"    stream session started {(time.time() - anchor.wall_anchor) / 60:.1f} min ago")
 
         intr = phone.latest(irtsp.Intrinsics, wait=3.0)
         if info.streams.get("intrinsics", False):
@@ -58,6 +58,7 @@ def main() -> int:
         counts: Counter[str] = Counter()
         gaps: Counter[str] = Counter()
         times: dict[str, list[float]] = defaultdict(list)
+        offsets: list[float] = []  # local receipt time − record unix_ts
         quat_bad = mono_bad = clock_bad = 0
 
         stream = phone.stream(buffer=65536)
@@ -66,6 +67,8 @@ def main() -> int:
             name = type(rec).__name__
             counts[name] += 1
             gaps[name] += rec.gap
+            if len(offsets) < 500:
+                offsets.append(time.time() - rec.unix_ts)
             ts = times[name]
             if ts and rec.host_ts < ts[-1]:
                 mono_bad += 1
@@ -93,6 +96,14 @@ def main() -> int:
         imu_n = counts.get("IMU", 0)
         if info.streams.get("imu", True):
             (ok if imu_n > args.seconds * 20 else bad)(f"IMU flowing ({imu_n} records)")
+        if offsets:
+            # Median of (receipt − stamp): network+decode latency plus real clock
+            # skew. NTP-synced devices land within tens of ms; >5s means one of
+            # the clocks is genuinely wrong.
+            med = sorted(offsets)[len(offsets) // 2]
+            (ok if abs(med) < 5.0 else bad)(
+                f"phone↔host clock offset ≈ {med * 1000:+.0f} ms (median of {len(offsets)} receipts)"
+            )
         (ok if mono_bad == 0 else bad)(f"host_ts monotonic per stream ({mono_bad} violations)")
         (ok if clock_bad == 0 else bad)(
             f"unix_ts == anchor(host_ts) on every record ({clock_bad} mismatches)"
