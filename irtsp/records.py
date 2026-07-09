@@ -321,7 +321,7 @@ class Heading(Record):
 
 @dataclass(frozen=True, kw_only=True, slots=True, match_args=False)
 class Pose(Record):
-    """ARKit 6-DOF world pose (wire type 9), ~60 Hz in AR pose mode.
+    """ARKit 6-DOF world pose (wire type 9); rate matches the AR camera (30-60 Hz).
 
     The world frame is gravity-aligned with its origin at session start.
     ``host_ts`` is the ``ARFrame`` timestamp — the same axis as the video PTS,
