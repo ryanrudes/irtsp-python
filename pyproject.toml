@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "irtsp"
+dynamic = ["version"]
+description = "Friendly Python client for iRTSP — typed, time-synced iPhone camera + IMU / GPS / LiDAR-depth / ARKit-pose streams"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ryan Rudes", email = "ryanrudes@gmail.com" }]
+keywords = [
+    "rtsp", "imu", "vio", "visual-inertial-odometry", "ios", "iphone",
+    "robotics", "slam", "sensors", "lidar", "arkit", "camera",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Video :: Capture",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+
+# The core library is pure stdlib. Heavier features are opt-in extras.
+dependencies = []
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.22"]          # depth maps as arrays, point clouds
+discovery = ["zeroconf>=0.39"]   # irtsp.discover() over Bonjour/mDNS
+video = ["av>=10", "numpy>=1.22"]  # RTSP video frames + synced() bundles (EXPERIMENTAL)
+all = ["numpy>=1.22", "zeroconf>=0.39", "av>=10"]
+
+[project.urls]
+Homepage = "https://github.com/ryanrudes/irtsp-python"
+Documentation = "https://github.com/ryanrudes/irtsp-support/blob/main/INTEGRATION.md"
+Support = "https://ryanrudes.github.io/irtsp-support/"
+Source = "https://github.com/ryanrudes/irtsp-python"
+
+[tool.hatch.version]
+path = "irtsp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["irtsp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
