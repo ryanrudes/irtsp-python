@@ -324,6 +324,18 @@ def test_pose_record_golden() -> None:
     assert rec.position == Vec3(1.5, -2.25, 0.5)
     assert rec.orientation == Quat(0.0, 0.0, 0.5, 0.5)
     assert rec.tracking is Tracking.NORMAL
+    assert rec.discontinuity is False  # flags byte 0 by default
+
+
+def test_pose_discontinuity_flag() -> None:
+    # flags @1 bit0 = first pose after an ARKit interruption/relocalization (app >= 1.1)
+    buf = bytearray(_pose_buf(2.0))
+    buf[1] = 0x01
+    assert decode_record(bytes(buf)).discontinuity is True
+    buf[1] = 0xFE  # other flag bits set, bit0 clear -> False (forward compat)
+    assert decode_record(bytes(buf)).discontinuity is False
+    buf[1] = 0xFF
+    assert decode_record(bytes(buf)).discontinuity is True
 
 
 @pytest.mark.parametrize(

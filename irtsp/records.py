@@ -333,6 +333,10 @@ class Pose(Record):
     position: Vec3  #: meters, world frame
     orientation: Quat  #: body → world
     tracking: Tracking
+    #: True on the first pose after an ARKit session interruption / relocalization —
+    #: the world frame may have jumped discontinuously; re-anchor any registration.
+    #: (Wire flags bit0; always False from app versions before 1.1.)
+    discontinuity: bool = False
 
     def transform(self, point: Vec3) -> Vec3:
         """Map a point from the device's body frame into the world frame."""

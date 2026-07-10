@@ -212,6 +212,8 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
             position=Vec3(tx, ty, tz),
             orientation=Quat(qx, qy, qz, qw),
             tracking=Tracking(state) if state in (0, 1, 2) else Tracking.NONE,
+            # flags bit0: first pose after an interruption/relocalization (app >= 1.1)
+            discontinuity=bool(buf[1] & 0x01),
             **common,
         )
 
