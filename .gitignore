@@ -5,3 +5,6 @@ dist/
 build/
 .venv/
 .pytest_cache/
+
+# macOS
+.DS_Store

@@ -326,6 +326,14 @@ class Pose(Record):
     The world frame is gravity-aligned with its origin at session start.
     ``host_ts`` is the ``ARFrame`` timestamp — the same axis as the video PTS,
     so poses line up with video frames directly.
+
+    Two things ARKit itself will not tell you, and this record will:
+
+    * :attr:`discontinuity` — the world frame moved under you (see below).
+    * :attr:`gravity_tilt_deg` — the world frame is not actually level (see
+      :attr:`is_level`). ARKit learns gravity from *motion*, so a session begun
+      while the phone sits still can run tens of degrees off vertical with
+      ``tracking`` reporting ``NORMAL`` for every pose.
     """
 
     __match_args__: ClassVar[tuple[str, ...]] = ("position", "orientation", "tracking")
@@ -333,14 +341,64 @@ class Pose(Record):
     position: Vec3  #: meters, world frame
     orientation: Quat  #: body → world
     tracking: Tracking
-    #: True on the first pose after an ARKit session interruption / relocalization —
-    #: the world frame may have jumped discontinuously; re-anchor any registration.
-    #: (Wire flags bit0; always False from app versions before 1.1.)
+    #: The world frame moved under you: re-anchor any registration here, and do not
+    #: integrate across this sample. True whenever :attr:`relocalized` or :attr:`jump`
+    #: is set, and after an ARKit session interruption.
+    #: (Wire flags bit0; always False on apps too old to report it.)
     discontinuity: bool = False
+    #: Tracking recovered (``LIMITED``/``NONE`` → ``NORMAL``); ARKit re-anchors its map
+    #: at this moment. (Wire flags bit1; always False on apps too old to report it.)
+    relocalized: bool = False
+    #: The pose took a kinematically impossible step while ``tracking`` stayed ``NORMAL``
+    #: — i.e. a silent loop closure or map merge, which fires no ARKit callback at all
+    #: and is invisible in ``tracking``. (Wire flags bit2; always False on apps too old
+    #: to report it.)
+    jump: bool = False
+    #: Degrees between ARKit's world **+Y** and true gravity (measured on-device against
+    #: CoreMotion). ``0`` is level; sustained non-zero means the world frame is tilted and
+    #: everything derived from it is wrong by that angle. ``nan`` when the phone did not
+    #: report it: raw IMU mode has no fused gravity, and older apps did not send the field.
+    gravity_tilt_deg: float = math.nan
+    #: Which way the frame leans: ``atan2(z, x)`` of world-frame gravity's horizontal
+    #: component, in degrees. Meaningless and numerically unstable as the tilt → 0.
+    gravity_azimuth_deg: float = math.nan
 
     def transform(self, point: Vec3) -> Vec3:
         """Map a point from the device's body frame into the world frame."""
         return self.orientation.rotate(point) + self.position
+
+    @property
+    def gravity_tilt_rad(self) -> float:
+        return math.radians(self.gravity_tilt_deg)
+
+    @property
+    def gravity_azimuth_rad(self) -> float:
+        return math.radians(self.gravity_azimuth_deg)
+
+    @property
+    def gravity_world(self) -> Vec3 | None:
+        """Gravity as a unit vector **in ARKit's world frame**, or None if unreported.
+
+        Exactly ``(0, -1, 0)`` when the world frame is perfectly level; the deviation is
+        what :attr:`gravity_tilt_deg` measures. Rebuilt from the (tilt, azimuth) pair,
+        which carries the vector's full two degrees of freedom — so you can derive the
+        rotation that *levels* the frame, not merely detect that it is crooked.
+        """
+        t, a = self.gravity_tilt_rad, self.gravity_azimuth_rad
+        if math.isnan(t) or math.isnan(a):
+            return None
+        return Vec3(math.sin(t) * math.cos(a), -math.cos(t), math.sin(t) * math.sin(a))
+
+    def is_level(self, tolerance_deg: float = 5.0) -> bool:
+        """Whether ARKit's world frame is trustworthy as a gravity reference.
+
+        Unreported tilt (``nan``) counts as **not** level: an old app or raw IMU mode
+        cannot vouch for the frame, and silently treating that as level is the exact
+        failure this field exists to prevent.
+
+        A tilted frame is fixed by *moving*: walk the phone around and ARKit converges.
+        """
+        return bool(self.gravity_tilt_deg <= tolerance_deg)  # nan compares False
 
 
 @dataclass(frozen=True, kw_only=True, match_args=False)  # no slots: cached_property below

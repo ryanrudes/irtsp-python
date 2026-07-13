@@ -72,7 +72,7 @@ iterator** with its own buffer — create as many as you like, they don't compet
 | `GNSS` | `phone.gnss` | ~1 Hz | `lat`/`lon` deg · `altitude` m · `speed` m/s · `h_accuracy`/`v_accuracy` m · `course_deg` | `course_rad` |
 | `Altitude` | `phone.altitude` | ~1 Hz | `relative_altitude` m · `pressure` **Pa** | `pressure_kpa`, `pressure_hpa` |
 | `Heading` | `phone.heading` | event-driven | `true_deg` · `magnetic_deg` · `accuracy_deg` | `true_rad`, `magnetic_rad` |
-| `Pose` | `phone.pose` | ~60 Hz (AR mode) | `position` m (gravity-aligned world frame) · `orientation` quat · `tracking` | — |
+| `Pose` | `phone.pose` | ~60 Hz (AR mode) | `position` m (gravity-aligned world frame) · `orientation` quat · `tracking` · `discontinuity`/`relocalized`/`jump` · `gravity_tilt_deg` · `is_level()` | `gravity_tilt_rad`, `gravity_world` |
 | `DepthFrame` | `phone.depth` | ≤ 30 Hz | half-float **meters**; `meters` (ndarray), `at(x, y)`, `point_cloud(K)` | — |
 
 Unit conventions, in one breath: SI everywhere by default — the wire's g-units become
@@ -85,6 +85,42 @@ values ever reach your code.
 
 Every record also carries `host_ts`, `unix_ts`, `seq`, `gap`, and a `time` property
 (`unix_ts` as an aware UTC `datetime`). More on the two clocks below.
+
+## Two things ARKit will not tell you (but `Pose` will)
+
+`tracking == NORMAL` is **not** a promise that the pose is usable. Two failure modes hide
+completely behind it, and both are silent — no exception, no state change, no callback:
+
+**The world frame can move under you.** ARKit re-anchors its map on loop closure, and it
+does so without ever leaving `NORMAL`. Positions jump metres between consecutive frames.
+`discontinuity` is set on every such sample — re-anchor there and never integrate across
+it. `relocalized` and `jump` say *which* kind it was.
+
+**The world frame can be tilted.** `worldAlignment = .gravity` promises world +Y is up,
+but ARKit learns gravity from *motion*. Start a session with the phone sitting still and
+barely move it, and the frame can settle tens of degrees off vertical — for the whole
+capture, with `NORMAL` tracking throughout. Everything derived from it (ground planes,
+registration, reprojection) is then wrong by that angle, and nothing in ARKit says so.
+
+The phone measures the true tilt against CoreMotion and sends it, because **a client
+cannot compute it**: recovering it here would mean fitting a device→camera rotation from
+gravity samples, and that fit is rank-deficient whenever the phone stays upright — it
+absorbs the tilt and confidently reports ~0°. On-device the relationship is a known
+constant, so one sample settles it.
+
+```python
+for pose in phone.pose:
+    if not pose.is_level():          # nan (old app / raw mode) is NOT level
+        raise SystemExit(f"ARKit frame is {pose.gravity_tilt_deg:.0f}° off gravity — "
+                         "walk the phone around before capturing")
+    if pose.discontinuity:
+        registration.reanchor()      # world frame moved; do not integrate across this
+```
+
+`gravity_world` rebuilds gravity as a unit vector in ARKit's frame, so you can derive the
+rotation that *levels* the capture rather than merely rejecting it. Both gravity fields are
+`nan` in raw IMU mode and on apps too old to send them, and `is_level()` treats unknown as
+not level — an app that cannot vouch for its frame must not be trusted by default.
 
 ## Discovery
 

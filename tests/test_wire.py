@@ -305,7 +305,7 @@ def test_heading_record_negative_sentinels() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Type 9: pose  (t xyz f32@24, trackingState f32@36, quat xyzw f32@48)
+# Type 9: pose  (t xyz f32@24, trackingState f32@36, gravity f32x2@40, quat f32x4@48)
 # --------------------------------------------------------------------------- #
 
 
@@ -336,6 +336,67 @@ def test_pose_discontinuity_flag() -> None:
     assert decode_record(bytes(buf)).discontinuity is False
     buf[1] = 0xFF
     assert decode_record(bytes(buf)).discontinuity is True
+
+
+def test_pose_relocalized_and_jump_flags() -> None:
+    # bit1 = tracking recovered; bit2 = silent loop closure (app >= 1.2)
+    buf = bytearray(_pose_buf(2.0))
+    buf[1] = 0x03  # discontinuity + relocalized
+    rec = decode_record(bytes(buf))
+    assert (rec.discontinuity, rec.relocalized, rec.jump) == (True, True, False)
+    buf[1] = 0x05  # discontinuity + jump
+    rec = decode_record(bytes(buf))
+    assert (rec.discontinuity, rec.relocalized, rec.jump) == (True, False, True)
+
+
+def test_pose_gravity_tilt() -> None:
+    buf = bytearray(_pose_buf(2.0))
+    struct.pack_into("<2f", buf, 40, 20.0, 90.0)  # 20° off vertical, leaning +z
+    rec = decode_record(bytes(buf))
+    assert rec.gravity_tilt_deg == pytest.approx(20.0)
+    assert rec.gravity_azimuth_deg == pytest.approx(90.0)
+    assert rec.gravity_tilt_rad == pytest.approx(math.radians(20.0))
+    # A 20° tilt is not a level frame, and the pair must rebuild world-frame gravity.
+    assert rec.is_level() is False
+    gx, gy, gz = rec.gravity_world
+    assert (gx, gy, gz) == pytest.approx((0.0, -math.cos(math.radians(20)),
+                                          math.sin(math.radians(20))), abs=1e-6)
+    assert math.hypot(gx, gy, gz) == pytest.approx(1.0)
+
+
+def test_pose_gravity_level() -> None:
+    buf = bytearray(_pose_buf(2.0))
+    struct.pack_into("<2f", buf, 40, 0.4, -12.0)  # a converged frame, as measured on-device
+    rec = decode_record(bytes(buf))
+    assert rec.is_level() is True
+    gx, gy, gz = rec.gravity_world
+    # Gravity points essentially straight down, with only sin(0.4°) leaking sideways.
+    assert gy == pytest.approx(-1.0, abs=1e-4)
+    assert math.hypot(gx, gz) == pytest.approx(math.sin(math.radians(0.4)), abs=1e-6)
+
+
+def test_pose_is_level_boundary() -> None:
+    buf = bytearray(_pose_buf(2.0))
+    for tilt, default, strict in [(4.9, True, False), (5.0, True, False), (5.1, False, False)]:
+        struct.pack_into("<2f", buf, 40, tilt, 0.5)
+        rec = decode_record(bytes(buf))
+        assert rec.is_level() is default
+        assert rec.is_level(tolerance_deg=1.0) is strict
+
+
+def test_pose_gravity_absent_is_nan_not_zero() -> None:
+    """A pre-1.2 app zero-filled bytes 40..48.
+
+    Decoding that as a literal 0.0° tilt would declare those captures perfectly level —
+    the exact false negative the field exists to catch. It must read as unknown, and
+    unknown must not pass is_level().
+    """
+    rec = decode_record(_pose_buf(2.0))  # 40..48 left as zeros, as the old app sent them
+    assert math.isnan(rec.gravity_tilt_deg)
+    assert math.isnan(rec.gravity_azimuth_deg)
+    assert rec.gravity_world is None
+    assert rec.is_level() is False          # unknown is NOT level
+    assert rec.is_level(tolerance_deg=180) is False  # and no tolerance can make it level
 
 
 @pytest.mark.parametrize(

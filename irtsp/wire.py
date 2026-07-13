@@ -206,14 +206,28 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
 
     if type_id == RecordType.POSE:
         tx, ty, tz, tracking = struct.unpack_from("<4f", buf, 24)
+        tilt, azimuth = struct.unpack_from("<2f", buf, 40)
         qx, qy, qz, qw = struct.unpack_from("<4f", buf, 48)
         state = int(tracking)
+        # Bytes 40..48 were a zero-filled hole on older apps. Decoding that as a literal
+        # 0.0° tilt would report those captures as PERFECTLY level — the precise false
+        # negative this field exists to catch. An app that really measures gravity never
+        # emits an exact 0.0/0.0 pair (the azimuth is an atan2 of sensor noise), so treat
+        # exact zeros as "not reported" and let them surface as nan.
+        if tilt == 0.0 and azimuth == 0.0:
+            tilt = azimuth = math.nan
         return Pose(
             position=Vec3(tx, ty, tz),
             orientation=Quat(qx, qy, qz, qw),
             tracking=Tracking(state) if state in (0, 1, 2) else Tracking.NONE,
-            # flags bit0: first pose after an interruption/relocalization (app >= 1.1)
+            # flags bit0: the world frame moved — re-anchor here
             discontinuity=bool(buf[1] & 0x01),
+            # bit1: tracking recovered; bit2: silent loop closure / map merge
+            # (both zero on older apps, which is indistinguishable from 'did not happen')
+            relocalized=bool(buf[1] & 0x02),
+            jump=bool(buf[1] & 0x04),
+            gravity_tilt_deg=tilt,
+            gravity_azimuth_deg=azimuth,
             **common,
         )
 
