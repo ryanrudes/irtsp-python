@@ -339,14 +339,28 @@ def test_pose_discontinuity_flag() -> None:
 
 
 def test_pose_relocalized_and_jump_flags() -> None:
-    # bit1 = tracking recovered; bit2 = silent loop closure (app >= 1.2)
+    # bit1 = tracking recovered; bit2 = silent loop closure
     buf = bytearray(_pose_buf(2.0))
     buf[1] = 0x03  # discontinuity + relocalized
     rec = decode_record(bytes(buf))
-    assert (rec.discontinuity, rec.relocalized, rec.jump) == (True, True, False)
+    assert (rec.discontinuity, rec.relocalized, rec.jump, rec.reset) == (True, True, False, False)
     buf[1] = 0x05  # discontinuity + jump
     rec = decode_record(bytes(buf))
-    assert (rec.discontinuity, rec.relocalized, rec.jump) == (True, False, True)
+    assert (rec.discontinuity, rec.relocalized, rec.jump, rec.reset) == (True, False, True, False)
+
+
+def test_pose_reset_flag() -> None:
+    """bit3 = the operator reset tracking: a brand-new world frame starts here.
+
+    Distinct from relocalized/jump on purpose — those are warnings that the tracker papered
+    something over; this one is deliberate and clean. A consumer must start a fresh epoch, not
+    merely skip the sample.
+    """
+    buf = bytearray(_pose_buf(2.0))
+    buf[1] = 0x09  # discontinuity + reset — exactly what the app emits (verified on-device)
+    rec = decode_record(bytes(buf))
+    assert (rec.discontinuity, rec.reset) == (True, True)
+    assert (rec.relocalized, rec.jump) == (False, False)  # a reset is neither of those
 
 
 def test_pose_gravity_tilt() -> None:

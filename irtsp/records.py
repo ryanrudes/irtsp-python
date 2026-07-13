@@ -354,6 +354,21 @@ class Pose(Record):
     #: and is invisible in ``tracking``. (Wire flags bit2; always False on apps too old
     #: to report it.)
     jump: bool = False
+    #: **The operator reset tracking, and a brand-new world frame starts here.**
+    #:
+    #: Unlike :attr:`relocalized` and :attr:`jump` — which are data-quality *warnings* about
+    #: something the tracker papered over — this one is deliberate and clean: someone noticed a
+    #: broken frame and fixed it. Report it as "a new epoch starts here", not "the phone
+    #: teleported".
+    #:
+    #: It is also the one flag you cannot honour merely by skipping a sample. The new frame has a
+    #: new origin, new yaw and new gravity alignment; every earlier pose is expressed in a frame
+    #: that no longer exists, and **no transform relates the two sides**. Close your epoch and
+    #: re-derive every registration from scratch. (``host_ts`` *does* stay continuous — only the
+    #: spatial frame is replaced, never the clock.)
+    #:
+    #: (Wire flags bit3; always False on apps too old to report it.)
+    reset: bool = False
     #: Degrees between ARKit's world **+Y** and true gravity (measured on-device against
     #: CoreMotion). ``0`` is level; sustained non-zero means the world frame is tilted and
     #: everything derived from it is wrong by that angle.

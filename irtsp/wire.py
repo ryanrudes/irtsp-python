@@ -222,10 +222,12 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
             tracking=Tracking(state) if state in (0, 1, 2) else Tracking.NONE,
             # flags bit0: the world frame moved — re-anchor here
             discontinuity=bool(buf[1] & 0x01),
-            # bit1: tracking recovered; bit2: silent loop closure / map merge
-            # (both zero on older apps, which is indistinguishable from 'did not happen')
+            # bit1: tracking recovered; bit2: silent loop closure / map merge;
+            # bit3: operator reset tracking -> a BRAND-NEW world frame starts here
+            # (all zero on older apps, which is indistinguishable from 'did not happen')
             relocalized=bool(buf[1] & 0x02),
             jump=bool(buf[1] & 0x04),
+            reset=bool(buf[1] & 0x08),
             gravity_tilt_deg=tilt,
             gravity_azimuth_deg=azimuth,
             **common,

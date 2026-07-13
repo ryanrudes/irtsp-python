@@ -96,11 +96,23 @@ does so without ever leaving `NORMAL`. Positions jump metres between consecutive
 `discontinuity` is set on every such sample — re-anchor there and never integrate across
 it. `relocalized` and `jump` say *which* kind it was.
 
+`reset` (the operator reset tracking) is different in kind, not degree: it means a **brand-new
+world frame** — new origin, new yaw, new gravity — and *no transform relates it to the old one*.
+Close your epoch and re-derive everything; skipping one sample and carrying on with your existing
+transform will silently produce confident, wrong results. (`host_ts` stays continuous across a
+reset; only the spatial frame is replaced.)
+
 **The world frame can be tilted.** `worldAlignment = .gravity` promises world +Y is up,
 but ARKit learns gravity from *motion*. Start a session with the phone sitting still and
 barely move it, and the frame can settle tens of degrees off vertical — for the whole
 capture, with `NORMAL` tracking throughout. Everything derived from it (ground planes,
 registration, reprojection) is then wrong by that angle, and nothing in ARKit says so.
+
+Worse, a *badly* tilted frame **never heals**: ARKit fixes its gravity early in a session and does
+not revisit it. A measured frame 110° off was still 100° off after 40 s of walking with good
+tracking. Only a tracking reset recovers it. And the way frames get broken is the default rig
+workflow — leaving the phone face-down on the table while you set up other gear, so ARKit
+initialises with no parallax. **Carry the phone while you rig, or reset before you record.**
 
 The phone measures the true tilt against CoreMotion and sends it, because **a client
 cannot compute it**: recovering it here would mean fitting a device→camera rotation from
