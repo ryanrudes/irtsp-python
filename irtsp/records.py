@@ -356,8 +356,16 @@ class Pose(Record):
     jump: bool = False
     #: Degrees between ARKit's world **+Y** and true gravity (measured on-device against
     #: CoreMotion). ``0`` is level; sustained non-zero means the world frame is tilted and
-    #: everything derived from it is wrong by that angle. ``nan`` when the phone did not
-    #: report it: raw IMU mode has no fused gravity, and older apps did not send the field.
+    #: everything derived from it is wrong by that angle.
+    #:
+    #: Already a robust on-device estimate — you do not need to median it. CoreMotion's gravity
+    #: is a fusion whose accelerometer correction goes transiently wrong under hand acceleration,
+    #: so the phone rejects samples taken while it is accelerating and medians the rest.
+    #:
+    #: ``nan`` means **the phone cannot currently vouch for a value** — raw IMU mode (no fused
+    #: gravity), an app too old to send the field, or the device having been in sustained motion
+    #: long enough that every trustworthy sample aged out. See :attr:`is_level`, which treats
+    #: ``nan`` as not level.
     gravity_tilt_deg: float = math.nan
     #: Which way the frame leans: ``atan2(z, x)`` of world-frame gravity's horizontal
     #: component, in degrees. Meaningless and numerically unstable as the tilt → 0.
@@ -392,11 +400,13 @@ class Pose(Record):
     def is_level(self, tolerance_deg: float = 5.0) -> bool:
         """Whether ARKit's world frame is trustworthy as a gravity reference.
 
-        Unreported tilt (``nan``) counts as **not** level: an old app or raw IMU mode
-        cannot vouch for the frame, and silently treating that as level is the exact
+        An unreported tilt (``nan``) counts as **not** level. The phone says ``nan``
+        precisely when it cannot vouch for the frame — old app, raw IMU mode, or the
+        device in sustained motion — and silently reading that as level is the exact
         failure this field exists to prevent.
 
-        A tilted frame is fixed by *moving*: walk the phone around and ARKit converges.
+        A genuinely tilted frame is fixed by *moving*: walk the phone around and ARKit
+        converges.
         """
         return bool(self.gravity_tilt_deg <= tolerance_deg)  # nan compares False
 

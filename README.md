@@ -118,9 +118,15 @@ for pose in phone.pose:
 ```
 
 `gravity_world` rebuilds gravity as a unit vector in ARKit's frame, so you can derive the
-rotation that *levels* the capture rather than merely rejecting it. Both gravity fields are
-`nan` in raw IMU mode and on apps too old to send them, and `is_level()` treats unknown as
-not level — an app that cannot vouch for its frame must not be trusted by default.
+rotation that *levels* the capture rather than merely rejecting it.
+
+The tilt is **already a robust on-device estimate — don't median it yourself.** CoreMotion's
+gravity is a fusion whose accelerometer correction goes transiently wrong under hand
+acceleration, so the phone rejects samples taken while it is accelerating and medians the rest.
+`nan` means the phone **cannot currently vouch for a value** — raw IMU mode, an app too old to
+send it, or the device in sustained motion long enough that every trustworthy sample aged out.
+`is_level()` treats `nan` as **not** level: a phone that cannot vouch for its frame must not be
+trusted by default.
 
 ## Discovery
 
