@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .clock import StreamClock, interpolate_pose, slerp
+from .clock import KNOWN_TIMEBASES, StreamClock, interpolate_pose, slerp
 from .records import (
     STANDARD_GRAVITY,
     Altitude,
@@ -113,6 +113,7 @@ __all__ = [
     "STANDARD_GRAVITY",
     # clock
     "StreamClock",
+    "KNOWN_TIMEBASES",
     "slerp",
     "interpolate_pose",
     # protocol
