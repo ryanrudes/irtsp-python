@@ -39,6 +39,7 @@ __all__ = [
     "Vec3",
     "Quat",
     "Tracking",
+    "TrackingReason",
     "Record",
     "IMU",
     "RawGyro",
@@ -163,6 +164,21 @@ class Tracking(IntEnum):
     NONE = 0
     LIMITED = 1
     NORMAL = 2
+
+
+class TrackingReason(IntEnum):
+    """*Why* tracking is :attr:`Tracking.LIMITED` (ARKit's ``TrackingState.Reason``).
+
+    ``NONE`` when tracking is normal or unavailable. ``RELOCALIZING`` is the one to watch: it
+    explains a subsequent world-frame snap-back, which otherwise looks like a teleport.
+    """
+
+    NONE = 0
+    INITIALIZING = 1
+    EXCESSIVE_MOTION = 2
+    INSUFFICIENT_FEATURES = 3
+    RELOCALIZING = 4
+    UNKNOWN = 5  #: a reason introduced by a newer ARKit than this client knows about
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -369,6 +385,24 @@ class Pose(Record):
     #:
     #: (Wire flags bit3; always False on apps too old to report it.)
     reset: bool = False
+    #: **ARKit's position has provably diverged. This take is not usable.**
+    #:
+    #: The phone's own accelerometer says it is sitting still while ARKit's pose runs away. That is
+    #: not a heuristic or a tuned threshold — it is two sensors that must agree, and don't. In the
+    #: field capture that motivated this, the phone lay on a table for 16 s (accel σ = 0.01 m/s²)
+    #: while its reported position accelerated to **872 m**, with ``tracking == NORMAL`` throughout.
+    #:
+    #: The usual cause is *degenerate geometry*, not poor features: repeating planar texture (brick,
+    #: tiling, carpet) aliases by one tile, self-consistently, and the filter integrates a phantom
+    #: flow. Feature-count checks see nothing wrong because the scene is feature-*rich*.
+    #:
+    #: :attr:`gravity_tilt_deg` structurally cannot catch this — gravity can be perfect while the
+    #: position is nonsense. Only the at-rest cross-check can.
+    #:
+    #: (Wire flags bit4; always False on apps too old to report it.)
+    diverged: bool = False
+    #: Why tracking is ``LIMITED`` (``NONE`` when it isn't). See :class:`TrackingReason`.
+    reason: TrackingReason = TrackingReason.NONE
     #: Degrees between ARKit's world **+Y** and true gravity (measured on-device against
     #: CoreMotion). ``0`` is level; sustained non-zero means the world frame is tilted and
     #: everything derived from it is wrong by that angle.

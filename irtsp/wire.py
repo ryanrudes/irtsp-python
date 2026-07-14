@@ -38,6 +38,7 @@ from .records import (
     RawGyro,
     Record,
     Tracking,
+    TrackingReason,
     Unknown,
     Vec3,
 )
@@ -57,6 +58,8 @@ __all__ = [
 
 #: Fixed size of every odometry record on the wire.
 RECORD_SIZE = 64
+
+_REASONS = frozenset(r.value for r in TrackingReason)
 
 #: Maximum sane length-prefixed message (guards against desync garbage).
 MAX_MESSAGE = 64 * 1024 * 1024
@@ -228,6 +231,10 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
             relocalized=bool(buf[1] & 0x02),
             jump=bool(buf[1] & 0x04),
             reset=bool(buf[1] & 0x08),
+            # bit4: the IMU says the phone is still while ARKit's pose runs away
+            diverged=bool(buf[1] & 0x10),
+            # byte 4 (formerly reserved): ARKit's TrackingState.Reason
+            reason=(TrackingReason(buf[4]) if buf[4] in _REASONS else TrackingReason.UNKNOWN),
             gravity_tilt_deg=tilt,
             gravity_azimuth_deg=azimuth,
             **common,

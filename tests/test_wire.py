@@ -44,6 +44,7 @@ from irtsp.records import (
     RawAccel,
     RawGyro,
     Tracking,
+    TrackingReason,
     Unknown,
     Vec3,
 )
@@ -347,6 +348,46 @@ def test_pose_relocalized_and_jump_flags() -> None:
     buf[1] = 0x05  # discontinuity + jump
     rec = decode_record(bytes(buf))
     assert (rec.discontinuity, rec.relocalized, rec.jump, rec.reset) == (True, False, True, False)
+
+
+def test_pose_diverged_flag() -> None:
+    """bit4 = the IMU says the phone is still while ARKit's pose runs away.
+
+    The field capture: 16 s on a table (accel sigma 0.01 m/s^2) while the reported position
+    accelerated to 872 m, with tracking == NORMAL the whole time. gravity_tilt cannot catch this —
+    gravity can be perfect while the position is nonsense.
+    """
+    buf = bytearray(_pose_buf(2.0))
+    buf[1] = 0x11  # discontinuity + diverged
+    rec = decode_record(bytes(buf))
+    assert rec.diverged is True
+    assert rec.discontinuity is True
+    assert rec.tracking is Tracking.NORMAL  # ARKit still claims everything is fine
+    assert decode_record(_pose_buf(2.0)).diverged is False
+
+
+@pytest.mark.parametrize(
+    ("wire", "expected"),
+    [
+        (0, TrackingReason.NONE),
+        (1, TrackingReason.INITIALIZING),
+        (2, TrackingReason.EXCESSIVE_MOTION),
+        (3, TrackingReason.INSUFFICIENT_FEATURES),
+        (4, TrackingReason.RELOCALIZING),
+        (5, TrackingReason.UNKNOWN),
+        (99, TrackingReason.UNKNOWN),  # a future ARKit reason degrades, never raises
+    ],
+)
+def test_pose_tracking_reason(wire: int, expected: TrackingReason) -> None:
+    # byte 4 (formerly reserved) carries ARKit's TrackingState.Reason
+    buf = bytearray(_pose_buf(1.0))
+    buf[4] = wire
+    assert decode_record(bytes(buf)).reason is expected
+
+
+def test_pose_reason_defaults_to_none_on_old_apps() -> None:
+    # Older apps zero byte 4 (it was 'reserved'), which correctly reads as NONE.
+    assert decode_record(_pose_buf(2.0)).reason is TrackingReason.NONE
 
 
 def test_pose_reset_flag() -> None:
