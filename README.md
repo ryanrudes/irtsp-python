@@ -11,6 +11,8 @@ anchor captured once per session** — the same anchor that drives the video's R
 timeline — so video and odometry align with **no time offset to estimate**. The core
 is pure stdlib, Python ≥ 3.10.
 
+> **Get the app:** [iRTSP on the App Store](https://apps.apple.com/app/id6789029918) · [docs & support](https://ryanrudes.github.io/irtsp-support/)
+
 ## Install
 
 | Command | What you get |
