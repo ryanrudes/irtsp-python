@@ -43,6 +43,8 @@ from irtsp.records import (
     Quat,
     RawAccel,
     RawGyro,
+    SyncModel,
+    SyncState,
     Tracking,
     TrackingReason,
     Unknown,
@@ -569,6 +571,89 @@ def test_depth_frame_wrong_type_raises() -> None:
         decode_depth_frame(make_depth_payload(3, 2, samples, type_id=1))
 
 
+# --------------------------------------------------------------------------- #
+# SyncModel (type 10, odometry channel — cross-device clock model)
+#
+# 40-byte payload, little-endian:
+#   24 i64 offset_ns   32 f64 skew_ppm   40 i64 epoch_host_ns
+#   48 f32 residual_ns 52 u8  state      (53 pad)   54 u16 sample_count
+# --------------------------------------------------------------------------- #
+
+
+def make_sync(*, offset_ns: int = 123456789, skew_ppm: float = 24.7,
+              epoch_host_ns: int = 98765432100, residual_ns: float = 84000.0,
+              state: int = 2, sample_count: int = 42, seq: int = SEQ,
+              host_ts: float = HOST_TS, unix_ts: float = UNIX_TS) -> bytes:
+    buf = make_header(10, seq=seq, host_ts=host_ts, unix_ts=unix_ts)
+    struct.pack_into("<q", buf, 24, offset_ns)
+    struct.pack_into("<d", buf, 32, skew_ppm)
+    struct.pack_into("<q", buf, 40, epoch_host_ns)
+    struct.pack_into("<f", buf, 48, residual_ns)
+    struct.pack_into("<B", buf, 52, state)
+    struct.pack_into("<H", buf, 54, sample_count)
+    return bytes(buf)
+
+
+def test_sync_model_golden() -> None:
+    rec = decode_record(make_sync())
+    assert type(rec) is SyncModel
+    assert_common(rec)
+    assert rec.offset_ns == 123456789
+    assert rec.skew_ppm == 24.7  # f64 — the exact literal survives
+    assert rec.epoch_host_ns == 98765432100
+    assert rec.residual_ns == f32(84000.0)
+    assert rec.state is SyncState.CONVERGED
+    assert rec.sample_count == 42
+
+
+def test_sync_model_offset_is_signed_64bit() -> None:
+    # A follower behind the leader has a negative offset, and both offset and epoch
+    # exceed 2^31 — so both MUST decode as signed i64, not i32/u32.
+    rec = decode_record(make_sync(offset_ns=-5_000_000_000, epoch_host_ns=9_000_000_000))
+    assert isinstance(rec, SyncModel)
+    assert rec.offset_ns == -5_000_000_000
+    assert rec.epoch_host_ns == 9_000_000_000
+
+
+@pytest.mark.parametrize(
+    "wire_state, expected",
+    [(0, SyncState.NOT_CONVERGED),
+     (1, SyncState.OFFSET_ONLY),
+     (2, SyncState.CONVERGED),
+     (7, SyncState.NOT_CONVERGED)],  # unknown future state is never trusted
+)
+def test_sync_model_state_decoding(wire_state: int, expected: SyncState) -> None:
+    rec = decode_record(make_sync(state=wire_state))
+    assert isinstance(rec, SyncModel)
+    assert rec.state is expected
+
+
+def test_sync_model_leader_time_reproduces_formula() -> None:
+    rec = decode_record(make_sync(offset_ns=1_000_000, skew_ppm=25.0,
+                                  epoch_host_ns=2_000_000_000))
+    host_ns = 2_000_500_000  # 0.5 s past the epoch
+    expected = host_ns + 1_000_000 + 25.0 * 1e-6 * (host_ns - 2_000_000_000)
+    assert rec.leader_time(host_ns) == expected
+    # skew_ppm=0 (offset_only) degrades to a pure offset, exactly.
+    off_only = decode_record(make_sync(offset_ns=777, skew_ppm=0.0, epoch_host_ns=0))
+    assert off_only.leader_time(123_456_789) == 123_456_789 + 777
+
+
+def test_sync_model_preserves_64_byte_stride() -> None:
+    """A reader that ignores SyncModel still reads the record right after it: the
+    64-byte stride is uniform, so type 10 costs a following record nothing."""
+    sync = make_sync()
+    imu = make_header(1, seq=SEQ + 1)
+    struct.pack_into("<10f", imu, 24, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    stream = sync + bytes(imu)
+    recs = [decode_record(stream[i:i + RECORD_SIZE])
+            for i in range(0, len(stream), RECORD_SIZE)]
+    assert isinstance(recs[0], SyncModel)
+    assert isinstance(recs[1], IMU)
+    assert recs[1].seq == SEQ + 1
+    assert recs[1].gyro == Vec3(1.0, 2.0, 3.0)
+
+
 def test_record_type_enum_matches_swift_ids() -> None:
     assert RecordType.IMU == 1
     assert RecordType.GYRO == 2
@@ -579,6 +664,7 @@ def test_record_type_enum_matches_swift_ids() -> None:
     assert RecordType.HEADING == 8
     assert RecordType.POSE == 9
     assert RecordType.DEPTH == 10
+    assert RecordType.SYNC == 10  # channel-overloaded twin of DEPTH
 
 
 # --------------------------------------------------------------------------- #

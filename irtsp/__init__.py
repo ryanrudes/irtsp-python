@@ -47,6 +47,8 @@ from .records import (
     RawAccel,
     RawGyro,
     Record,
+    SyncModel,
+    SyncState,
     Tracking,
     TrackingReason,
     Unknown,
@@ -103,6 +105,8 @@ __all__ = [
     "Altitude",
     "Heading",
     "Pose",
+    "SyncModel",
+    "SyncState",
     "DepthFrame",
     "Unknown",
     # value types & constants

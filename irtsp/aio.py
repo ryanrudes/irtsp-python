@@ -35,6 +35,7 @@ from .records import (
     Intrinsics,
     Pose,
     Record,
+    SyncModel,
 )
 from .session import DEFAULT_BUFFER, Handshake, _check_handshake
 from .wire import (
@@ -178,9 +179,9 @@ class AsyncSession:
             while True:
                 buf = await reader.readexactly(RECORD_SIZE)
                 record = decode_record(buf)
-                # Server replays the latest Intrinsics (stale seq) to late
-                # joiners — don't let it baseline the gap tracker.
-                if last_seq is None and isinstance(record, Intrinsics):
+                # Server replays the latest Intrinsics and SyncModel (stale seq) to
+                # late joiners — don't let either baseline the gap tracker.
+                if last_seq is None and isinstance(record, (Intrinsics, SyncModel)):
                     self._dispatch(record, None)
                     continue
                 last_seq = self._dispatch(record, last_seq)
@@ -268,6 +269,11 @@ class AsyncSession:
     @property
     def pose(self) -> AsyncRecordStream[Pose]:
         return self.stream(Pose)
+
+    @property
+    def sync(self) -> AsyncRecordStream[SyncModel]:
+        """Cross-device clock models — one per re-fit, plus the latest replayed on connect."""
+        return self.stream(SyncModel)
 
     @property
     def depth(self) -> AsyncRecordStream[DepthFrame]:

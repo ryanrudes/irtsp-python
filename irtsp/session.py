@@ -45,6 +45,7 @@ from .records import (
     RawAccel,
     RawGyro,
     Record,
+    SyncModel,
 )
 from .wire import (
     RECORD_SIZE,
@@ -298,10 +299,10 @@ class Session:
                         return
                     sock, last_seq = sock2, None
                     continue
-                # Late joiners: the server replays the latest Intrinsics record
-                # with its ORIGINAL (stale) seq — don't let it baseline the gap
-                # tracker or the first live record shows a huge bogus gap.
-                if last_seq is None and isinstance(record, Intrinsics):
+                # Late joiners: the server replays the latest Intrinsics and SyncModel
+                # records with their ORIGINAL (stale) seq — don't let either baseline the
+                # gap tracker or the first live record shows a huge bogus gap.
+                if last_seq is None and isinstance(record, (Intrinsics, SyncModel)):
                     self._dispatch(record)
                     continue
                 last_seq = self._track_gap(record, last_seq)
@@ -438,6 +439,11 @@ class Session:
     @property
     def pose(self) -> RecordStream[Pose]:
         return self.stream(Pose)
+
+    @property
+    def sync(self) -> RecordStream[SyncModel]:
+        """Cross-device clock models — one per re-fit, plus the latest replayed on connect."""
+        return self.stream(SyncModel)
 
     @property
     def depth(self) -> RecordStream[DepthFrame]:

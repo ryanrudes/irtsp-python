@@ -22,6 +22,8 @@ from irtsp.records import (
     RawAccel,
     RawGyro,
     Record,
+    SyncModel,
+    SyncState,
     Tracking,
     Unknown,
     Vec3,
@@ -296,6 +298,56 @@ def test_depth_point_cloud_stride_and_nonfinite_drop() -> None:
     # rows 0,2,4 x cols 0,2,4,6 = 12 pixels, minus the inf at (0,0)
     assert strided.shape == (11, 3)
     assert np.all(strided[:, 2] == 2.0)
+
+
+# --------------------------------------------------------------------------- #
+# SyncModel
+# --------------------------------------------------------------------------- #
+
+
+def _sync(**over) -> SyncModel:
+    kw = dict(offset_ns=123456789, skew_ppm=24.7, epoch_host_ns=98765432100,
+              residual_ns=84000.0, state=SyncState.CONVERGED, sample_count=42)
+    kw.update(over)
+    return SyncModel(**kw, **COMMON)
+
+
+def test_sync_model_leader_time_matches_formula() -> None:
+    m = _sync(offset_ns=1_000_000, skew_ppm=25.0, epoch_host_ns=2_000_000_000)
+    host_ns = 2_000_500_000
+    expected = host_ns + 1_000_000 + 25.0 * 1e-6 * (host_ns - 2_000_000_000)
+    assert m.leader_time(host_ns) == expected
+
+
+def test_sync_model_leader_time_at_epoch_is_pure_offset() -> None:
+    # At host_ns == epoch the skew term vanishes, leaving exactly the offset.
+    m = _sync(offset_ns=-4200, epoch_host_ns=5_000_000_000)
+    assert m.leader_time(5_000_000_000) == 5_000_000_000 - 4200
+
+
+def test_sync_model_offset_only_ignores_skew() -> None:
+    m = _sync(skew_ppm=0.0, offset_ns=777, epoch_host_ns=0, state=SyncState.OFFSET_ONLY)
+    assert m.leader_time(999_999) == 999_999 + 777
+
+
+def test_sync_model_is_frozen() -> None:
+    m = _sync()
+    with pytest.raises(AttributeError):
+        m.offset_ns = 0  # type: ignore[misc]
+
+
+def test_sync_state_wire_values() -> None:
+    assert (SyncState.NOT_CONVERGED, SyncState.OFFSET_ONLY, SyncState.CONVERGED) == (0, 1, 2)
+
+
+def test_match_sync_model() -> None:
+    match _sync():
+        case SyncModel(offset_ns, skew_ppm, state):
+            assert offset_ns == 123456789
+            assert skew_ppm == 24.7
+            assert state is SyncState.CONVERGED
+        case _:
+            pytest.fail("SyncModel did not match")
 
 
 # --------------------------------------------------------------------------- #

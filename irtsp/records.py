@@ -49,6 +49,8 @@ __all__ = [
     "Altitude",
     "Heading",
     "Pose",
+    "SyncState",
+    "SyncModel",
     "DepthFrame",
     "Unknown",
 ]
@@ -179,6 +181,27 @@ class TrackingReason(IntEnum):
     INSUFFICIENT_FEATURES = 3
     RELOCALIZING = 4
     UNKNOWN = 5  #: a reason introduced by a newer ARKit than this client knows about
+
+
+class SyncState(IntEnum):
+    """How much of a device's cross-device clock model (:class:`SyncModel`) to trust.
+
+    The map is ``leader_ns = host_ns + offset_ns + skew_ppm·1e-6·(host_ns − epoch_host_ns)``;
+    the state says which terms are real yet:
+
+    * ``NOT_CONVERGED`` — no usable map (no leader bound, or still settling). Fall back
+      to per-device wall time and know you did.
+    * ``OFFSET_ONLY`` — offset is good but skew is not modelled yet (``skew_ppm`` is 0):
+      the single-offset RecSync approximation, fine for seconds, wrong past ~40 s of take.
+    * ``CONVERGED`` — offset **and** skew fit; sub-millisecond over a minutes-long take.
+
+    An unknown future state value decodes to ``NOT_CONVERGED`` — a state this client does
+    not understand must never be read as trustworthy.
+    """
+
+    NOT_CONVERGED = 0
+    OFFSET_ONLY = 1
+    CONVERGED = 2
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -458,6 +481,51 @@ class Pose(Record):
         converges.
         """
         return bool(self.gravity_tilt_deg <= tolerance_deg)  # nan compares False
+
+
+@dataclass(frozen=True, kw_only=True, slots=True, match_args=False)
+class SyncModel(Record):
+    """This device's clock mapped onto the shared **leader** timeline (wire type 10).
+
+    The estimator runs on the phone; the wire carries only the three fit parameters plus a
+    quality readout, and the consumer applies one line (:meth:`leader_time`) to put every
+    device on one clock. Records are **not** restamped — this model is metadata framelock
+    applies to a record's ``host_ts``, so per-device timestamps stay byte-identical.
+
+    Type 10 is shared with :class:`DepthFrame`, but the two never collide: a SyncModel rides
+    the 64-byte **odometry** stream, a DepthFrame the length-prefixed **depth** channel, and
+    each decoder only ever sees its own channel's bytes.
+
+    Like :class:`Intrinsics` it is emitted periodically (~1 Hz, whenever the fit refreshes)
+    and **replayed to late joiners** right after the handshake, so :meth:`irtsp.Session.latest`
+    and :meth:`irtsp.Session.sync` almost always have the current model soon after connect.
+
+    A handshake ``sync`` object carries the same parameters as an *advisory snapshot* captured
+    at connect; this record is the live path that keeps refining as skew converges — prefer it.
+    """
+
+    __match_args__: ClassVar[tuple[str, ...]] = ("offset_ns", "skew_ppm", "state")
+
+    offset_ns: int  #: leader − local at the epoch, integer nanoseconds
+    skew_ppm: float  #: leader clock rate vs local, parts-per-million (0 ⇒ OFFSET_ONLY)
+    epoch_host_ns: int  #: the local ``host_ts`` reference instant, integer nanoseconds
+    residual_ns: float  #: fit residual (spread of the mapping error), nanoseconds
+    state: SyncState  #: how much of the mapping is trustworthy — see :class:`SyncState`
+    sample_count: int  #: round-trip exchanges backing the current fit
+
+    def leader_time(self, host_ns: int) -> float:
+        """Put a device ``host_ts`` (integer nanoseconds) onto the leader timeline.
+
+        This one line is the whole cross-device contract — identical to the estimator that
+        produced the model, so framelock reproduces leader time without any on-device call::
+
+            leader_ns = host_ns + offset_ns + skew_ppm·1e-6·(host_ns − epoch_host_ns)
+
+        Returns leader nanoseconds as a float (the skew term is sub-nanosecond-fractional).
+        ``host_ns`` is ``round(record.host_ts * 1e9)`` — the same monotonic axis the model
+        was fit on, so no re-anchoring is needed.
+        """
+        return host_ns + self.offset_ns + self.skew_ppm * 1e-6 * (host_ns - self.epoch_host_ns)
 
 
 @dataclass(frozen=True, kw_only=True, match_args=False)  # no slots: cached_property below

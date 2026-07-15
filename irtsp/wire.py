@@ -37,6 +37,8 @@ from .records import (
     RawAccel,
     RawGyro,
     Record,
+    SyncModel,
+    SyncState,
     Tracking,
     TrackingReason,
     Unknown,
@@ -60,6 +62,7 @@ __all__ = [
 RECORD_SIZE = 64
 
 _REASONS = frozenset(r.value for r in TrackingReason)
+_SYNC_STATES = frozenset(s.value for s in SyncState)
 
 #: Maximum sane length-prefixed message (guards against desync garbage).
 MAX_MESSAGE = 64 * 1024 * 1024
@@ -77,6 +80,10 @@ class RecordType(IntEnum):
     HEADING = 8
     POSE = 9
     DEPTH = 10  # depth channel only
+    # Type 10 is channel-overloaded: DEPTH on the depth channel, SYNC on the odometry
+    # channel. Each decoder only sees its own channel's bytes, so the reuse is unambiguous
+    # on the wire; SYNC is an alias of DEPTH here (same numeric code, kept usable by name).
+    SYNC = 10  # odometry channel only — cross-device clock model (SyncModel)
 
 
 class ProtocolError(ValueError):
@@ -237,6 +244,25 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
             reason=(TrackingReason(buf[4]) if buf[4] in _REASONS else TrackingReason.UNKNOWN),
             gravity_tilt_deg=tilt,
             gravity_azimuth_deg=azimuth,
+            **common,
+        )
+
+    if type_id == RecordType.SYNC:
+        # Cross-device clock model on the odometry channel — replayed to late joiners like
+        # intrinsics. 40-byte payload, little-endian, offsets fixed by the Kotlin encoder:
+        #   24 i64 offset_ns   32 f64 skew_ppm   40 i64 epoch_host_ns
+        #   48 f32 residual_ns 52 u8  state      (53 pad)   54 u16 sample_count
+        offset_ns, skew_ppm, epoch_host_ns, residual_ns = struct.unpack_from("<qdqf", buf, 24)
+        raw_state = buf[52]
+        (sample_count,) = struct.unpack_from("<H", buf, 54)
+        return SyncModel(
+            offset_ns=offset_ns,
+            skew_ppm=skew_ppm,
+            epoch_host_ns=epoch_host_ns,
+            residual_ns=residual_ns,
+            # A state this client version doesn't know must not be read as trustworthy.
+            state=SyncState(raw_state) if raw_state in _SYNC_STATES else SyncState.NOT_CONVERGED,
+            sample_count=sample_count,
             **common,
         )
 
