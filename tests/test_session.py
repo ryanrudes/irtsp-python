@@ -362,6 +362,120 @@ def test_depth_channel_end_to_end(phone):
         assert f2.gap == 1  # depth channel has its own gap tracking
 
 
+# ----------------------------------------------- protocol v2: state channels
+
+
+def test_handshake_v2_accepted_and_exposed(request):
+    phone = MockPhone(version=2).start()
+    request.addfinalizer(phone.close)
+    with irtsp.connect("127.0.0.1", imu_port=phone.imu_port, timeout=2.0) as session:
+        info = session.info
+        assert info.version == 2
+        assert info.emission["imu"] == "continuous"
+        assert info.emission["heading"] == "state"
+        assert info.state_channels["keyframe_interval_s"] == 10
+        # a v2 session streams exactly like v1
+        stream = session.imu
+        phone.emit_imu(seq=1)
+        (rec,) = collect(stream, 1)
+        assert rec.seq == 1
+
+
+def test_snapshot_flag_surfaces_on_state_channels(phone, session):
+    stream = session.stream(irtsp.Intrinsics, irtsp.Heading)
+    phone.emit_intrinsics(seq=1, snapshot=True)   # connect-snapshot / keyframe
+    phone.emit_heading(seq=2, snapshot=False)     # a real change event
+    phone.emit_heading(seq=3, snapshot=True)      # 10 s keyframe
+    k, h_change, h_key = collect(stream, 3)
+    assert isinstance(k, irtsp.Intrinsics) and k.snapshot is True
+    assert h_change.snapshot is False
+    assert h_key.snapshot is True
+
+
+# ------------------------------------------- protocol v2: depth compression
+
+
+def depth_session(phone, **kwargs):
+    return irtsp.connect(
+        "127.0.0.1", imu_port=phone.imu_port,
+        depth=True, depth_port=phone.depth_port, timeout=2.0, **kwargs,
+    )
+
+
+def test_depth_compression_opt_in_sends_control_message(request):
+    phone = MockPhone(version=2).start()
+    request.addfinalizer(phone.close)
+    with depth_session(phone, depth_compression="zlib") as session:
+        # the exact wire bytes: [u32 LE length][UTF-8 JSON]
+        assert phone.recv_depth_control() == {"compression": "zlib"}
+        assert session.depth_codec == "zlib"
+
+        # compressed frames decode; a raw frame after opt-in decodes too
+        # (incompressible fallback — decoding follows per-frame flags)
+        stream = session.depth
+        meters = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+        phone.emit_depth(seq=1, width=3, height=2, samples=meters, codec="zlib")
+        phone.emit_depth(seq=2, width=3, height=2, samples=meters)  # raw fallback
+        f1, f2 = collect(stream, 2)
+        assert f1.at(2, 1) == pytest.approx(3.0)
+        assert f1.data == f2.data
+
+
+def test_depth_compression_auto_prefers_lzfse_when_available(request, monkeypatch):
+    phone = MockPhone(version=2).start()
+    request.addfinalizer(phone.close)
+    monkeypatch.setattr("irtsp.session._lzfse_available", lambda: True)
+    with depth_session(phone) as session:  # depth_compression defaults to "auto"
+        assert phone.recv_depth_control() == {"compression": "lzfse"}
+        assert session.depth_codec == "lzfse"
+
+
+def test_depth_compression_auto_falls_back_to_zlib(request, monkeypatch):
+    phone = MockPhone(version=2).start()
+    request.addfinalizer(phone.close)
+    monkeypatch.setattr("irtsp.session._lzfse_available", lambda: False)
+    with depth_session(phone) as session:
+        assert phone.recv_depth_control() == {"compression": "zlib"}
+        assert session.depth_codec == "zlib"
+
+
+def test_depth_compression_none_sends_nothing(request):
+    phone = MockPhone(version=2).start()
+    request.addfinalizer(phone.close)
+    with depth_session(phone, depth_compression=None) as session:
+        assert session.depth_codec is None
+        assert phone.recv_depth_control(timeout=0.3) is None
+
+
+def test_depth_compression_never_offered_to_v1_server(phone):
+    # the fixture phone is a v1 server: no `compression` key in its handshake,
+    # so the client must not send a control message no matter what was asked
+    with depth_session(phone, depth_compression="zlib") as session:
+        assert session.depth_codec is None
+        assert phone.recv_depth_control(timeout=0.3) is None
+        # and the channel still works, raw, exactly like v1
+        stream = session.depth
+        phone.emit_depth(seq=1, width=2, height=1, samples=[1.0, 2.0])
+        (frame,) = collect(stream, 1)
+        assert frame.at(1, 0) == 2.0
+
+
+def test_depth_compression_invalid_value_raises(phone):
+    with pytest.raises(ValueError, match="depth_compression"):
+        depth_session(phone, depth_compression="gzip")
+
+
+def test_depth_compression_renegotiated_after_reconnect(request):
+    phone = MockPhone(version=2).start()
+    request.addfinalizer(phone.close)
+    with depth_session(phone, depth_compression="zlib", reconnect=True) as session:
+        assert phone.recv_depth_control() == {"compression": "zlib"}
+        phone.close_depth_clients()  # codec choice is per-connection
+        assert phone.wait_for_depth_client(3.0)
+        assert phone.recv_depth_control() == {"compression": "zlib"}
+        assert session.depth_codec == "zlib"
+
+
 # ------------------------------------------------------------------- buffering
 
 

@@ -14,12 +14,12 @@ IMUWireFormat.swift / DepthStreamServer.swift exactly:
     24..64    type-specific payload (f32/f64 slots, see each test)
 
 Depth frame (after the u32 length prefix, which decode_depth_frame never sees):
-    0   u8    type (=10)      1  u8  flags (bit0: float16)
+    0   u8    type (=10)      1  u8  flags (bit0: float16, bit1: compressed — v2)
     2   u16   seq             4  u32 reserved
     8   f64   host_ts         16 f64 unix_ts
     24  u16   width           26 u16 height
-    28  u8    bytesPerPixel   29..31 pad
-    32.. row-major width*height IEEE-754 half floats (meters)
+    28  u8    bytesPerPixel   29 u8 codec (1 lzfse · 2 zlib)   30..31 pad
+    32.. row-major width*height IEEE-754 half floats (meters), raw or compressed
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import json
 import math
 import socket
 import struct
+import zlib
 
 import pytest
 
@@ -203,6 +204,22 @@ def test_intrinsics_record_golden() -> None:
     assert rec.cy == 360.125
     assert rec.width == 1280 and isinstance(rec.width, int)
     assert rec.height == 720 and isinstance(rec.height, int)
+    assert rec.snapshot is False  # flags 0 = a real change event
+
+
+def test_intrinsics_snapshot_flag() -> None:
+    # flags bit0 (v2 state channels) = snapshot/keyframe, stamped at send time
+    buf = make_header(5, flags=0x01)
+    struct.pack_into("<6f", buf, 24, 1000.5, 1001.25, 640.25, 360.125, 1280.0, 720.0)
+    rec = decode_record(bytes(buf))
+    assert isinstance(rec, Intrinsics)
+    assert rec.snapshot is True
+    # other flag bits set, bit0 clear -> still a change event (forward compat)
+    buf = make_header(5, flags=0xFE)
+    struct.pack_into("<6f", buf, 24, 1000.5, 1001.25, 640.25, 360.125, 1280.0, 720.0)
+    assert decode_record(bytes(buf)).snapshot is False
+    # and the snapshot marker survives a rescale
+    assert rec.scaled(640, 360).snapshot is True
 
 
 # --------------------------------------------------------------------------- #
@@ -305,6 +322,21 @@ def test_heading_record_negative_sentinels() -> None:
     assert rec.accuracy_deg is None
     assert rec.true_rad is None
     assert rec.magnetic_deg == 337.5  # magnetic has no invalid sentinel
+    assert rec.snapshot is False  # flags 0 = a real change event
+
+
+def test_heading_snapshot_flag() -> None:
+    # flags bit0 (v2 state channels) = snapshot/keyframe, stamped at send time
+    buf = make_header(8, flags=0x01)
+    struct.pack_into("<3f", buf, 24, 350.0, 337.5, 15.0)
+    rec = decode_record(bytes(buf))
+    assert isinstance(rec, Heading)
+    assert rec.snapshot is True
+    assert rec.true_deg == 350.0  # the value decodes identically either way
+    # other flag bits set, bit0 clear -> still a change event (forward compat)
+    buf = make_header(8, flags=0xFE)
+    struct.pack_into("<3f", buf, 24, 350.0, 337.5, 15.0)
+    assert decode_record(bytes(buf)).snapshot is False
 
 
 # --------------------------------------------------------------------------- #
@@ -508,10 +540,10 @@ def test_decode_record_truncated_raises() -> None:
 def make_depth_payload(width: int, height: int, samples: bytes, *,
                        type_id: int = 10, flags: int = 1, seq: int = SEQ,
                        host_ts: float = HOST_TS, unix_ts: float = UNIX_TS,
-                       bytes_per_pixel: int = 2) -> bytes:
+                       bytes_per_pixel: int = 2, codec: int = 0) -> bytes:
     header = bytearray(32)
     struct.pack_into("<B", header, 0, type_id)
-    struct.pack_into("<B", header, 1, flags)          # bit0: float16
+    struct.pack_into("<B", header, 1, flags)          # bit0: float16, bit1: compressed
     struct.pack_into("<H", header, 2, seq)
     struct.pack_into("<I", header, 4, 0)              # reserved
     struct.pack_into("<d", header, 8, host_ts)
@@ -519,8 +551,15 @@ def make_depth_payload(width: int, height: int, samples: bytes, *,
     struct.pack_into("<H", header, 24, width)
     struct.pack_into("<H", header, 26, height)
     struct.pack_into("<B", header, 28, bytes_per_pixel)
-    # 29..31 pad, already zero
+    struct.pack_into("<B", header, 29, codec)         # only meaningful when bit1 set
+    # 30..31 pad, already zero
     return bytes(header) + samples
+
+
+def raw_deflate(data: bytes) -> bytes:
+    """Compress the v2 'zlib' way: raw DEFLATE (RFC 1951), no zlib header/checksum."""
+    compressor = zlib.compressobj(wbits=-15)
+    return compressor.compress(data) + compressor.flush()
 
 
 def test_depth_frame_golden() -> None:
@@ -569,6 +608,86 @@ def test_depth_frame_wrong_type_raises() -> None:
     samples = struct.pack("<6e", *range(6))
     with pytest.raises(ProtocolError):
         decode_depth_frame(make_depth_payload(3, 2, samples, type_id=1))
+
+
+# --------------------------------------------------------------------------- #
+# Depth compression (v2): flags bit1 + codec id in header byte 29.
+# "zlib" (2) is raw DEFLATE; "lzfse" (1) is Apple's LZFSE buffer format.
+# --------------------------------------------------------------------------- #
+
+_HAS_LZFSE = True
+try:
+    import liblzfse as _liblzfse  # noqa: F401 — availability probe only
+except ImportError:
+    _HAS_LZFSE = False
+
+
+def test_depth_frame_zlib_compressed_golden() -> None:
+    values = (1.0, 2.0, 0.5, 4.0, 0.25, 8.0)  # exact in binary16
+    samples = struct.pack("<6e", *values)
+    payload = make_depth_payload(3, 2, raw_deflate(samples), flags=0b11, codec=2)
+    frame = decode_depth_frame(payload)
+    assert type(frame) is DepthFrame
+    assert_common(frame)
+    assert frame.data == samples  # decompressed back to the raw half-floats
+    assert frame.at(2, 0) == 0.5
+    assert frame.at(2, 1) == 8.0
+
+
+def test_depth_frame_zlib_is_raw_deflate_not_zlib_wrapped() -> None:
+    # A zlib-wrapped (RFC 1950) payload is NOT the wire format — the decoder
+    # must use raw DEFLATE and reject the two header bytes as garbage.
+    samples = struct.pack("<6e", *range(6))
+    payload = make_depth_payload(3, 2, zlib.compress(samples), flags=0b11, codec=2)
+    with pytest.raises(ProtocolError):
+        decode_depth_frame(payload)
+
+
+def test_depth_frame_lzfse_compressed_golden() -> None:
+    liblzfse = pytest.importorskip("liblzfse")
+    values = (1.0, 2.0, 0.5, 4.0, 0.25, 8.0)
+    samples = struct.pack("<6e", *values)
+    payload = make_depth_payload(3, 2, liblzfse.compress(samples), flags=0b11, codec=1)
+    frame = decode_depth_frame(payload)
+    assert frame.data == samples
+    assert frame.at(0, 1) == 4.0
+
+
+@pytest.mark.skipif(_HAS_LZFSE, reason="liblzfse installed — the error path is unreachable")
+def test_depth_frame_lzfse_without_decoder_says_how_to_fix_it() -> None:
+    samples = struct.pack("<6e", *range(6))
+    payload = make_depth_payload(3, 2, samples, flags=0b11, codec=1)
+    with pytest.raises(ProtocolError, match="pyliblzfse"):
+        decode_depth_frame(payload)
+
+
+def test_depth_frame_raw_after_opt_in() -> None:
+    # A frame that doesn't shrink is sent raw (bit1 clear) even after opt-in,
+    # possibly with a stale codec byte — decoding branches on the FLAGS, never
+    # on what was negotiated.
+    samples = struct.pack("<6e", *range(6))
+    frame = decode_depth_frame(make_depth_payload(3, 2, samples, flags=0b01, codec=2))
+    assert frame.data == samples
+
+
+def test_depth_frame_unknown_codec_raises() -> None:
+    samples = struct.pack("<6e", *range(6))
+    payload = make_depth_payload(3, 2, samples, flags=0b11, codec=9)
+    with pytest.raises(ProtocolError, match="codec id 9"):
+        decode_depth_frame(payload)
+
+
+def test_depth_frame_compressed_wrong_decompressed_size_raises() -> None:
+    samples = struct.pack("<7e", *range(7))  # one sample too many for 3x2
+    payload = make_depth_payload(3, 2, raw_deflate(samples), flags=0b11, codec=2)
+    with pytest.raises(ProtocolError):
+        decode_depth_frame(payload)
+
+
+def test_depth_frame_corrupt_deflate_raises_protocol_error() -> None:
+    payload = make_depth_payload(3, 2, b"\xff\xff\xff\xff", flags=0b11, codec=2)
+    with pytest.raises(ProtocolError):
+        decode_depth_frame(payload)
 
 
 # --------------------------------------------------------------------------- #

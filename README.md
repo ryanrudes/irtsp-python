@@ -68,10 +68,10 @@ iterator** with its own buffer — create as many as you like, they don't compet
 |---|---|---|---|---|
 | `IMU` | `phone.imu` | ≤ ~100 Hz | `gyro` rad/s · `accel` m/s² (gravity **included**; face-up at rest ≈ (0, 0, −9.81)) · `quat` (x, y, z, w), body→world | `accel_g` |
 | `RawGyro` / `RawAccel` | `phone.raw_gyro` / `phone.raw_accel` | raw sensor mode | rad/s · m/s² | `accel_g` |
-| `Intrinsics` | `phone.intrinsics` | on zoom/lens change | `fx fy cx cy` px at `width×height` · `matrix` (3×3 K) · `scaled()` | — |
+| `Intrinsics` | `phone.intrinsics` | on zoom/lens change, + 10 s keyframes (v2) | `fx fy cx cy` px at `width×height` · `matrix` (3×3 K) · `scaled()` · `snapshot` | — |
 | `GNSS` | `phone.gnss` | ~1 Hz | `lat`/`lon` deg · `altitude` m · `speed` m/s · `h_accuracy`/`v_accuracy` m · `course_deg` | `course_rad` |
 | `Altitude` | `phone.altitude` | ~1 Hz | `relative_altitude` m · `pressure` **Pa** | `pressure_kpa`, `pressure_hpa` |
-| `Heading` | `phone.heading` | event-driven | `true_deg` · `magnetic_deg` · `accuracy_deg` | `true_rad`, `magnetic_rad` |
+| `Heading` | `phone.heading` | on-change, capped ~1 Hz, + 10 s keyframes (v2) | `true_deg` · `magnetic_deg` · `accuracy_deg` · `snapshot` | `true_rad`, `magnetic_rad` |
 | `Pose` | `phone.pose` | ~60 Hz (AR mode) | `position` m (gravity-aligned world frame) · `orientation` quat · `tracking` · `discontinuity`/`relocalized`/`jump` · `gravity_tilt_deg` · `is_level()` | `gravity_tilt_rad`, `gravity_world` |
 | `DepthFrame` | `phone.depth` | ≤ 30 Hz | half-float **meters**; `meters` (ndarray), `at(x, y)`, `point_cloud(K)` | — |
 

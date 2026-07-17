@@ -261,8 +261,10 @@ class RawAccel(Record):
 class Intrinsics(Record):
     """Pinhole camera intrinsics (wire type 5), in pixels at (``width`` × ``height``).
 
-    Sent when the projection changes (zoom/lens switch) and replayed to late
-    joiners, so :meth:`irtsp.Session.latest` almost always has one.
+    A **state channel** (protocol v2): sent when the projection changes
+    (zoom/lens switch), plus a snapshot on connect and a keyframe every ~10 s
+    re-asserting the current value — so :meth:`irtsp.Session.latest` almost
+    always has one, and silence means "unchanged", never "absent".
     No lens-distortion model — the video is rectilinear.
     """
 
@@ -274,6 +276,11 @@ class Intrinsics(Record):
     cy: float  #: principal point y, px
     width: int  #: resolution the intrinsics are expressed at
     height: int
+    #: True for a snapshot/keyframe (wire flags bit0, protocol v2): the current
+    #: state re-asserted, stamped at send time. False for a real change event,
+    #: which carries the sensor's own timestamp. If you only care about the
+    #: value, ignore it. (Always False from v1 servers and older apps.)
+    snapshot: bool = False
 
     @property
     def matrix(self) -> tuple[tuple[float, float, float], ...]:
@@ -290,7 +297,7 @@ class Intrinsics(Record):
         return Intrinsics(
             host_ts=self.host_ts, unix_ts=self.unix_ts, seq=self.seq, gap=self.gap,
             fx=self.fx * sx, fy=self.fy * sy, cx=self.cx * sx, cy=self.cy * sy,
-            width=width, height=height,
+            width=width, height=height, snapshot=self.snapshot,
         )
 
 
@@ -341,13 +348,24 @@ class Altitude(Record):
 
 @dataclass(frozen=True, kw_only=True, slots=True, match_args=False)
 class Heading(Record):
-    """Compass heading (wire type 8), event-driven. Invalid values are ``None``."""
+    """Compass heading (wire type 8). Invalid values are ``None``.
+
+    A **state channel** (protocol v2): change events are rate-capped to ~1 Hz
+    (a change ≥ 5° is forwarded immediately), plus a snapshot on connect and a
+    keyframe every ~10 s re-asserting the current value — silence means
+    "unchanged", never "absent".
+    """
 
     __match_args__: ClassVar[tuple[str, ...]] = ("true_deg", "magnetic_deg")
 
     true_deg: float | None  #: degrees clockwise from true north
     magnetic_deg: float  #: degrees clockwise from magnetic north
     accuracy_deg: float | None  #: maximum deviation, degrees
+    #: True for a snapshot/keyframe (wire flags bit0, protocol v2): the current
+    #: state re-asserted, stamped at send time. False for a real change event,
+    #: which carries the sensor's own timestamp. If you only care about the
+    #: value, ignore it. (Always False from v1 servers and older apps.)
+    snapshot: bool = False
 
     @property
     def true_rad(self) -> float | None:

@@ -37,6 +37,7 @@ dependencies = []
 [project.optional-dependencies]
 numpy = ["numpy>=1.22"]          # depth maps as arrays, point clouds
 discovery = ["zeroconf>=0.39"]   # irtsp.discover() over Bonjour/mDNS
+lzfse = ["pyliblzfse"]           # LZFSE depth compression (zlib needs nothing)
 video = ["av>=10", "numpy>=1.22"]  # RTSP video frames + synced() bundles (EXPERIMENTAL)
 all = ["numpy>=1.22", "zeroconf>=0.39", "av>=10"]
 
