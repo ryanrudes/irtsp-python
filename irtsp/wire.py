@@ -9,7 +9,9 @@ Framing (both channels start the same way):
 * The **odometry** channel (default port 8555) then streams back-to-back fixed
   **64-byte** little-endian records — no per-record framing. Byte 0 is the type.
 * The **depth** channel (default port 8556) streams ``[u32 LE length][frame]``
-  where each frame is a 32-byte header + tightly-packed half-float samples.
+  where each frame is a 32-byte header + tightly-packed half-float samples —
+  raw, or losslessly compressed per-frame (protocol v2, negotiated by the
+  client sending ``[u32 LE length][{"compression": ...} JSON]`` back).
 
 Reference: https://github.com/ryanrudes/irtsp-support/blob/main/INTEGRATION.md
 (and, upstream, ``IMUWireFormat.swift`` / ``DepthStreamServer.swift`` in the app).
@@ -21,6 +23,7 @@ import json
 import math
 import socket
 import struct
+import zlib
 from enum import IntEnum
 from typing import Any
 
@@ -37,6 +40,8 @@ from .records import (
     RawAccel,
     RawGyro,
     Record,
+    SyncModel,
+    SyncState,
     Tracking,
     TrackingReason,
     Unknown,
@@ -46,6 +51,8 @@ from .records import (
 __all__ = [
     "RECORD_SIZE",
     "MAX_MESSAGE",
+    "DEPTH_CODEC_LZFSE",
+    "DEPTH_CODEC_ZLIB",
     "RecordType",
     "ProtocolError",
     "ConnectionClosed",
@@ -60,6 +67,7 @@ __all__ = [
 RECORD_SIZE = 64
 
 _REASONS = frozenset(r.value for r in TrackingReason)
+_SYNC_STATES = frozenset(s.value for s in SyncState)
 
 #: Maximum sane length-prefixed message (guards against desync garbage).
 MAX_MESSAGE = 64 * 1024 * 1024
@@ -77,6 +85,10 @@ class RecordType(IntEnum):
     HEADING = 8
     POSE = 9
     DEPTH = 10  # depth channel only
+    # Type 10 is channel-overloaded: DEPTH on the depth channel, SYNC on the odometry
+    # channel. Each decoder only sees its own channel's bytes, so the reuse is unambiguous
+    # on the wire; SYNC is an alias of DEPTH here (same numeric code, kept usable by name).
+    SYNC = 10  # odometry channel only — cross-device clock model (SyncModel)
 
 
 class ProtocolError(ValueError):
@@ -172,7 +184,10 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
     if type_id == RecordType.INTRINSICS:
         fx, fy, cx, cy, width, height = struct.unpack_from("<6f", buf, 24)
         return Intrinsics(
-            fx=fx, fy=fy, cx=cx, cy=cy, width=int(width), height=int(height), **common
+            fx=fx, fy=fy, cx=cx, cy=cy, width=int(width), height=int(height),
+            # flags bit0 (v2 state channels): snapshot/keyframe, stamped at send time
+            snapshot=bool(buf[1] & 0x01),
+            **common,
         )
 
     if type_id == RecordType.GNSS:
@@ -204,6 +219,8 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
             true_deg=_optional(true_h),
             magnetic_deg=magnetic,
             accuracy_deg=_optional(accuracy),
+            # flags bit0 (v2 state channels): snapshot/keyframe, stamped at send time
+            snapshot=bool(buf[1] & 0x01),
             **common,
         )
 
@@ -240,6 +257,25 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
             **common,
         )
 
+    if type_id == RecordType.SYNC:
+        # Cross-device clock model on the odometry channel — replayed to late joiners like
+        # intrinsics. 40-byte payload, little-endian, offsets fixed by the Kotlin encoder:
+        #   24 i64 offset_ns   32 f64 skew_ppm   40 i64 epoch_host_ns
+        #   48 f32 residual_ns 52 u8  state      (53 pad)   54 u16 sample_count
+        offset_ns, skew_ppm, epoch_host_ns, residual_ns = struct.unpack_from("<qdqf", buf, 24)
+        raw_state = buf[52]
+        (sample_count,) = struct.unpack_from("<H", buf, 54)
+        return SyncModel(
+            offset_ns=offset_ns,
+            skew_ppm=skew_ppm,
+            epoch_host_ns=epoch_host_ns,
+            residual_ns=residual_ns,
+            # A state this client version doesn't know must not be read as trustworthy.
+            state=SyncState(raw_state) if raw_state in _SYNC_STATES else SyncState.NOT_CONVERGED,
+            sample_count=sample_count,
+            **common,
+        )
+
     return Unknown(type_id=type_id, payload=bytes(buf[24:RECORD_SIZE]), **common)
 
 
@@ -247,17 +283,56 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
 # Depth frames (their own channel; length-prefixed)
 #
 # 32-byte header (little-endian):
-#   0  u8   type (=10)   1  u8   flags (bit0: samples are float16)
+#   0  u8   type (=10)   1  u8   flags (bit0: samples are float16,
+#                                       bit1: payload compressed — v2, negotiated)
 #   2  u16  seq          4  u32  reserved
 #   8  f64  host_ts      16 f64  unix_ts
-#   24 u16  width        26 u16  height    28 u8  bytesPerPixel   29..31 pad
+#   24 u16  width        26 u16  height    28 u8  bytesPerPixel
+#   29 u8   codec (1 lzfse · 2 zlib; only meaningful when flags bit1 is set)
+#   30..31  pad
 # --------------------------------------------------------------------------- #
 
 _DEPTH_HEADER = 32
 
+#: Depth codec ids (header byte 29, protocol v2 — INTEGRATION.md §6.1).
+DEPTH_CODEC_LZFSE = 1
+DEPTH_CODEC_ZLIB = 2
+
+
+def _decompress_depth(codec_id: int, data: bytes) -> bytes:
+    """Undo a v2 depth payload's per-frame lossless compression."""
+    if codec_id == DEPTH_CODEC_ZLIB:
+        # "zlib" on the wire is raw DEFLATE (RFC 1951): no zlib header/checksum.
+        try:
+            return zlib.decompress(data, -15)
+        except zlib.error as e:
+            raise ProtocolError(f"depth payload failed DEFLATE decompression: {e}") from e
+    if codec_id == DEPTH_CODEC_LZFSE:
+        try:
+            import liblzfse
+        except ImportError as e:
+            raise ProtocolError(
+                "depth frame is LZFSE-compressed but no decoder is installed — "
+                "pip install pyliblzfse (or negotiate depth_compression='zlib')"
+            ) from e
+        try:
+            return liblzfse.decompress(data)
+        except Exception as e:
+            raise ProtocolError(f"depth payload failed LZFSE decompression: {e}") from e
+    raise ProtocolError(
+        f"unknown depth compression codec id {codec_id} — upgrade the irtsp package"
+    )
+
 
 def decode_depth_frame(payload: bytes) -> DepthFrame:
-    """Decode one depth-channel frame (header + samples, without the u32 prefix)."""
+    """Decode one depth-channel frame (header + samples, without the u32 prefix).
+
+    Handles the v2 negotiated compression transparently: a frame whose flags
+    bit1 is set is decompressed per its codec byte, so :attr:`DepthFrame.data`
+    always holds raw half-floats. Every frame is independently decodable, and a
+    server may send any frame raw even after opt-in (incompressible fallback) —
+    the decision is per-frame flags, never the negotiated codec.
+    """
     if len(payload) < _DEPTH_HEADER:
         raise ProtocolError(f"depth frame needs ≥{_DEPTH_HEADER} bytes, got {len(payload)}")
     type_id = payload[0]
@@ -270,12 +345,14 @@ def decode_depth_frame(payload: bytes) -> DepthFrame:
     width, height = struct.unpack_from("<HH", payload, 24)
     bytes_per_pixel = payload[28]
 
-    data = payload[_DEPTH_HEADER:]
-    expected = width * height * bytes_per_pixel
     if not flags & 0x01:  # bit0 = samples are float16 (the only format defined today)
         raise ProtocolError(f"unsupported depth pixel format (flags={flags:#04x}, expected float16)")
     if bytes_per_pixel != 2:
         raise ProtocolError(f"unsupported depth pixel size {bytes_per_pixel} (expected float16)")
+    data = payload[_DEPTH_HEADER:]
+    if flags & 0x02:  # bit1 = payload compressed (codec in byte 29)
+        data = _decompress_depth(payload[29], data)
+    expected = width * height * bytes_per_pixel
     if len(data) != expected:
         raise ProtocolError(
             f"depth payload is {len(data)} bytes, expected {expected} for {width}x{height}"

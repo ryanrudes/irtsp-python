@@ -6,11 +6,13 @@ session; unix = wall_anchor + (host - host_anchor)) and INTEGRATION.md §3-4.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import pytest
 
 from irtsp import (
+    KNOWN_TIMEBASES,
     Pose,
     Quat,
     StreamClock,
@@ -103,6 +105,49 @@ class TestStreamClock:
         assert clock.wall_anchor == 0.0
         assert clock.to_unix(123.5) == 123.5
         assert clock.to_host(123.5) == 123.5
+
+    def test_from_handshake_reports_ios_timebase(self):
+        clock = StreamClock.from_handshake(
+            {"clock": {"timebase": "mach_absolute_time_seconds",
+                       "host_anchor": HOST_ANCHOR, "wall_anchor": WALL_ANCHOR}}
+        )
+        assert clock.timebase == "mach_absolute_time_seconds"
+
+    def test_from_handshake_accepts_android_timebase(self):
+        """The Android server's honest timebase is accepted, not rejected, and the
+        anchor math is identical — the conversion never depended on the timebase."""
+        clock = StreamClock.from_handshake(
+            {"clock": {"timebase": "android_elapsed_realtime_seconds",
+                       "host_anchor": HOST_ANCHOR, "wall_anchor": WALL_ANCHOR}}
+        )
+        assert clock.timebase == "android_elapsed_realtime_seconds"
+        assert clock.timebase in KNOWN_TIMEBASES
+        assert clock.to_unix(HOST_ANCHOR + 1.5) == WALL_ANCHOR + 1.5
+
+    def test_absent_timebase_defaults_to_mach_for_backward_compat(self):
+        """A handshake predating the timebase field is iOS/mach by construction."""
+        clock = StreamClock.from_handshake(
+            {"clock": {"host_anchor": HOST_ANCHOR, "wall_anchor": WALL_ANCHOR}}
+        )
+        assert clock.timebase == "mach_absolute_time_seconds"
+
+    def test_unrecognized_timebase_warns_but_still_converts(self, caplog):
+        """An unknown timebase is non-fatal — the anchor math is timebase-agnostic —
+        but it is surfaced, because it means a platform newer than this client."""
+        with caplog.at_level(logging.WARNING, logger="irtsp"):
+            clock = StreamClock.from_handshake(
+                {"clock": {"timebase": "some_future_platform_clock",
+                           "host_anchor": HOST_ANCHOR, "wall_anchor": WALL_ANCHOR}}
+            )
+        assert clock.timebase == "some_future_platform_clock"
+        assert clock.timebase not in KNOWN_TIMEBASES
+        assert clock.to_unix(HOST_ANCHOR + 2.0) == WALL_ANCHOR + 2.0  # still correct
+        assert any("unrecognized clock timebase" in r.message for r in caplog.records)
+
+    def test_default_constructed_clock_is_mach(self):
+        """The dataclass default keeps existing StreamClock(...) call sites valid."""
+        clock = StreamClock(host_anchor=HOST_ANCHOR, wall_anchor=WALL_ANCHOR)
+        assert clock.timebase == "mach_absolute_time_seconds"
 
 
 # --------------------------------------------------------------------------- #

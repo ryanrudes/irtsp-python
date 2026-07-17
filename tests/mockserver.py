@@ -24,6 +24,7 @@ import json
 import socket
 import struct
 import threading
+import zlib
 from typing import Any, Callable, Iterable, Sequence
 
 RECORD_SIZE = 64
@@ -58,6 +59,9 @@ class _Channel:
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._closed = False
+        # Everything any client sent back (v2 clients send control messages).
+        self._recv_cond = threading.Condition()
+        self._received = bytearray()
 
     @property
     def port(self) -> int:
@@ -94,7 +98,30 @@ class _Channel:
                 continue
             with self._lock:
                 self._clients.append(conn)
+            threading.Thread(
+                target=self._read_loop, args=(conn,),
+                name=f"mock-{self.name}-read", daemon=True,
+            ).start()
             self.connected.set()
+
+    def _read_loop(self, conn: socket.socket) -> None:
+        """Collect client→server bytes (the v2 compression opt-in rides here)."""
+        while True:
+            try:
+                chunk = conn.recv(4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            with self._recv_cond:
+                self._received += chunk
+                self._recv_cond.notify_all()
+
+    def wait_received(self, n: int, timeout: float = 2.0) -> bytes:
+        """Block until clients have sent ≥ ``n`` bytes total; return a snapshot."""
+        with self._recv_cond:
+            self._recv_cond.wait_for(lambda: len(self._received) >= n, timeout)
+            return bytes(self._received)
 
     def broadcast(self, data: bytes) -> None:
         """Send ``data`` to every connected client (fire-and-forget, like the app).
@@ -167,6 +194,8 @@ class MockPhone:
         streams: dict[str, bool] | None = None,
         attitude: bool = True,
         rate_hz: float = 200.0,
+        version: int = 1,
+        depth_codecs: Sequence[str] = ("lzfse", "zlib"),
     ):
         self.host_anchor = host_anchor
         self.wall_anchor = wall_anchor
@@ -175,6 +204,8 @@ class MockPhone:
         self.video_clock_rate = video_clock_rate
         self.attitude = attitude
         self.rate_hz = rate_hz
+        self.version = version
+        self.depth_codecs = list(depth_codecs)  # advertised when version >= 2
         self.streams: dict[str, bool] = dict(streams) if streams is not None else {
             "imu": True,
             "intrinsics": True,
@@ -188,6 +219,7 @@ class MockPhone:
         self._odo_seq = 0
         self._depth_seq = 0
         self._ticks = 0
+        self._depth_ctrl_offset = 0  # parse cursor into the depth channel's inbox
 
     # ------------------------------------------------------------- lifecycle
 
@@ -231,10 +263,10 @@ class MockPhone:
         }
 
     def _odometry_handshake(self) -> dict[str, Any]:
-        """Mirrors ``IMUStreamServer.makeHandshake``."""
-        return {
+        """Mirrors ``IMUStreamServer.makeHandshake`` (v2 adds the state-channel keys)."""
+        handshake: dict[str, Any] = {
             "protocol": "irtsp-imu",
-            "version": 1,
+            "version": self.version,
             "endianness": "little",
             "record_bytes": RECORD_SIZE,
             "mode": "fused",
@@ -259,12 +291,23 @@ class MockPhone:
             },
             "streams": dict(self.streams),
         }
+        if self.version >= 2:
+            handshake["emission"] = {
+                "imu": "continuous", "gyro": "continuous", "accel": "continuous",
+                "pose": "continuous", "gnss": "event", "altitude": "event",
+                "intrinsics": "state", "heading": "state",
+            }
+            handshake["state_channels"] = {
+                "keyframe_interval_s": 10,
+                "flags": {"bit0": "snapshot_or_keyframe"},
+            }
+        return handshake
 
     def _depth_handshake(self) -> dict[str, Any]:
-        """Mirrors ``DepthStreamServer.makeHandshake``."""
-        return {
+        """Mirrors ``DepthStreamServer.makeHandshake`` (v2 advertises compression)."""
+        handshake: dict[str, Any] = {
             "protocol": "irtsp-depth",
-            "version": 1,
+            "version": self.version,
             "endianness": "little",
             "frame_type": T_DEPTH,
             "pixel_format": "depth_float16",
@@ -272,6 +315,31 @@ class MockPhone:
             "clock": self._clock_dict(),
             "video": {"rtsp_url": self.video_url, "codec": self.video_codec},
         }
+        if self.version >= 2:
+            handshake["compression"] = {
+                "supported": list(self.depth_codecs),
+                "request": '[u32 LE length][{"compression": "<codec>"} JSON]',
+            }
+        return handshake
+
+    # ------------------------------------------------- client control messages
+
+    def recv_depth_control(self, timeout: float = 2.0) -> dict[str, Any] | None:
+        """The next ``[u32 LE length][JSON]`` message a depth client sent, or None.
+
+        This is how a v2 client opts in to compression; a well-behaved client
+        sends nothing at all to a v1 handshake.
+        """
+        start = self._depth_ctrl_offset
+        buf = self._depth.wait_received(start + 4, timeout)
+        if len(buf) < start + 4:
+            return None
+        (length,) = struct.unpack_from("<I", buf, start)
+        buf = self._depth.wait_received(start + 4 + length, timeout)
+        if len(buf) < start + 4 + length:
+            return None
+        self._depth_ctrl_offset = start + 4 + length
+        return json.loads(buf[start + 4 : start + 4 + length].decode("utf-8"))
 
     # -------------------------------------------------------------- encoding
 
@@ -377,11 +445,16 @@ class MockPhone:
         cy: float = 540.0,
         width: int = 1920,
         height: int = 1080,
+        snapshot: bool = False,
     ) -> int:
-        """Type 5: [fx, fy, ox] @24 then [oy, width, height] @36."""
+        """Type 5: [fx, fy, ox] @24 then [oy, width, height] @36.
+
+        ``snapshot=True`` sets flags bit0 (v2 state-channel snapshot/keyframe).
+        """
         seq = self._next_odo_seq(seq)
         host_ts, unix_ts = self._times(host_ts, unix_ts)
         buf = self._record(T_INTRINSICS, seq, host_ts, unix_ts)
+        buf[1] = 0x01 if snapshot else 0x00
         struct.pack_into("<6f", buf, 24, fx, fy, cx, cy, float(width), float(height))
         self._odo.broadcast(bytes(buf))
         return seq
@@ -436,11 +509,16 @@ class MockPhone:
         true_deg: float = 90.0,
         magnetic_deg: float = 88.0,
         accuracy_deg: float = 5.0,
+        snapshot: bool = False,
     ) -> int:
-        """Type 8: true @24, magnetic @28, accuracy @32 (negatives = invalid)."""
+        """Type 8: true @24, magnetic @28, accuracy @32 (negatives = invalid).
+
+        ``snapshot=True`` sets flags bit0 (v2 state-channel snapshot/keyframe).
+        """
         seq = self._next_odo_seq(seq)
         host_ts, unix_ts = self._times(host_ts, unix_ts)
         buf = self._record(T_HEADING, seq, host_ts, unix_ts)
+        buf[1] = 0x01 if snapshot else 0x00
         struct.pack_into("<3f", buf, 24, true_deg, magnetic_deg, accuracy_deg)
         self._odo.broadcast(bytes(buf))
         return seq
@@ -494,11 +572,16 @@ class MockPhone:
         width: int,
         height: int,
         samples: bytes | Iterable[float],
+        codec: str | None = None,
     ) -> int:
         """One length-prefixed depth frame: 32-byte header + float16 meters.
 
         ``samples`` is either pre-packed little-endian float16 bytes or a
         row-major iterable of ``width*height`` distances in meters.
+        ``codec`` compresses the payload the v2 way (flags bit1 + codec id in
+        header byte 29): ``"zlib"`` is raw DEFLATE, ``"lzfse"`` needs the
+        optional ``liblzfse`` package. ``None`` sends raw — which a v2 server
+        may legitimately do even after a client opted in.
         """
         if seq is None:
             self._depth_seq = (self._depth_seq + 1) & 0xFFFF
@@ -510,15 +593,31 @@ class MockPhone:
             values = list(samples)
             assert len(values) == width * height, "need width*height samples"
             samples = struct.pack(f"<{len(values)}e", *values)
+        flags = 1  # bit0: samples are float16
+        codec_id = 0
+        if codec == "zlib":
+            compressor = zlib.compressobj(wbits=-15)  # raw DEFLATE, RFC 1951
+            samples = compressor.compress(bytes(samples)) + compressor.flush()
+            flags |= 2  # bit1: payload compressed
+            codec_id = 2
+        elif codec == "lzfse":
+            import liblzfse
+
+            samples = liblzfse.compress(bytes(samples))
+            flags |= 2
+            codec_id = 1
+        elif codec is not None:
+            raise ValueError(f"unknown mock depth codec {codec!r}")
         header = bytearray(DEPTH_HEADER_SIZE)
         header[0] = T_DEPTH
-        header[1] = 1  # flags bit0: samples are float16
+        header[1] = flags
         struct.pack_into("<H", header, 2, seq & 0xFFFF)
         # 4..8 reserved
         struct.pack_into("<d", header, 8, host_ts)
         struct.pack_into("<d", header, 16, unix_ts)
         struct.pack_into("<HH", header, 24, width, height)
         header[28] = 2  # bytesPerPixel
-        # 29..31 pad
+        header[29] = codec_id
+        # 30..31 pad
         self._depth.broadcast(length_prefixed(bytes(header) + bytes(samples)))
         return seq

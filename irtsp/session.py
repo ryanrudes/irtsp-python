@@ -25,8 +25,10 @@ unsubscribe deterministically.
 
 from __future__ import annotations
 
+import json
 import logging
 import socket
+import struct
 import threading
 import time
 import weakref
@@ -45,6 +47,7 @@ from .records import (
     RawAccel,
     RawGyro,
     Record,
+    SyncModel,
 )
 from .wire import (
     RECORD_SIZE,
@@ -69,6 +72,13 @@ R = TypeVar("R", bound=Record)
 #: Records buffered per consumer before its oldest are dropped.
 DEFAULT_BUFFER = 8192
 
+#: Highest handshake version this client fully understands (v2: state-channel
+#: snapshots/keyframes + negotiated depth compression).
+KNOWN_VERSION = 2
+
+#: Accepted values for the ``depth_compression`` parameter (``None`` == "none").
+DEPTH_COMPRESSION_VALUES = ("auto", "lzfse", "zlib", "none")
+
 
 class Handshake:
     """The server's JSON handshake, with the useful bits as attributes.
@@ -85,6 +95,11 @@ class Handshake:
         self.clock: StreamClock = StreamClock.from_handshake(raw)
         #: Which optional streams this session has enabled, e.g. ``{"gnss": True, ...}``.
         self.streams: dict[str, bool] = dict(raw.get("streams", {}))
+        #: How each stream flows (v2+): ``"continuous"`` | ``"event"`` | ``"state"``.
+        #: Empty from v1 servers.
+        self.emission: dict[str, str] = dict(raw.get("emission", {}) or {})
+        #: The v2 state-channel contract (``keyframe_interval_s`` etc.); empty on v1.
+        self.state_channels: dict[str, Any] = dict(raw.get("state_channels", {}) or {})
         video = raw.get("video", {}) or {}
         self.video_url: str | None = video.get("rtsp_url")
         self.video_codec: str | None = video.get("codec")
@@ -112,13 +127,81 @@ def _check_handshake(info: Handshake, expected_protocol: str) -> None:
             f"server uses {info.record_bytes}-byte records; this client only "
             f"understands {RECORD_SIZE} — upgrade the irtsp package"
         )
-    if info.version > 1:
+    if info.version > KNOWN_VERSION:
         log.warning(
-            "server speaks %s v%d, this client knows v1 — continuing, unknown "
+            "server speaks %s v%d, this client knows v%d — continuing, unknown "
             "record types will surface as irtsp.Unknown",
             info.protocol or expected_protocol,
             info.version,
+            KNOWN_VERSION,
         )
+
+
+def _lzfse_available() -> bool:
+    """Whether the optional LZFSE decoder (``pip install 'irtsp[lzfse]'``) is importable."""
+    try:
+        import liblzfse  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _choose_depth_codec(info: Handshake, preference: str) -> str | None:
+    """Pick the compression codec to request from a depth server, or ``None`` for raw.
+
+    A handshake without a ``compression`` key is a v1 server — never send it a
+    control message, whatever was asked for. ``"auto"`` prefers lzfse when both
+    the server advertises it and the decoder is installed, else zlib (stdlib),
+    else raw. An explicit codec the server doesn't offer degrades to raw with a
+    warning; an explicit ``"lzfse"`` without the decoder installed raises,
+    because every subsequent frame would be undecodable.
+    """
+    advertised = info.raw.get("compression")
+    if not isinstance(advertised, Mapping):
+        if preference not in ("auto", "none"):
+            log.warning(
+                "depth server does not offer compression (v1 handshake) — "
+                "depth_compression=%r ignored, staying raw", preference,
+            )
+        return None
+    if preference == "none":
+        return None
+    supported = advertised.get("supported") or []
+    if preference == "auto":
+        if "lzfse" in supported and _lzfse_available():
+            return "lzfse"
+        if "zlib" in supported:
+            return "zlib"
+        return None
+    if preference not in supported:
+        log.warning(
+            "depth server does not support %r compression (offers %s) — staying raw",
+            preference, supported,
+        )
+        return None
+    if preference == "lzfse" and not _lzfse_available():
+        raise ImportError(
+            "depth_compression='lzfse' needs the pyliblzfse package — "
+            "pip install 'irtsp[lzfse]' (or use 'zlib' or 'auto')"
+        )
+    return preference
+
+
+def _compression_request(codec: str) -> bytes:
+    """The client→server opt-in control message: ``[u32 LE length][UTF-8 JSON]``."""
+    blob = json.dumps({"compression": codec}).encode("utf-8")
+    return struct.pack("<I", len(blob)) + blob
+
+
+def _check_depth_compression(value: str | None) -> str:
+    """Normalize/validate a ``depth_compression`` parameter (``None`` → ``"none"``)."""
+    normalized = "none" if value is None else value
+    if normalized not in DEPTH_COMPRESSION_VALUES:
+        raise ValueError(
+            f"depth_compression must be one of {DEPTH_COMPRESSION_VALUES} or None, "
+            f"got {value!r}"
+        )
+    return normalized
 
 
 class RecordStream(Iterator[R]):
@@ -195,6 +278,7 @@ class Session:
         imu_port: int = 8555,
         depth: bool = False,
         depth_port: int = 8556,
+        depth_compression: str | None = "auto",
         video: bool = False,
         video_url: str | None = None,
         video_auth: tuple[str, str] | None = None,
@@ -206,6 +290,9 @@ class Session:
         self.imu_port = imu_port
         self.depth_enabled = depth
         self.depth_port = depth_port
+        self.depth_compression = _check_depth_compression(depth_compression)
+        #: Codec negotiated on the current depth connection (``None`` = raw).
+        self.depth_codec: str | None = None
         self.video_enabled = video
         self._video_url_override = video_url
         self._video_auth = video_auth
@@ -245,6 +332,7 @@ class Session:
                 depth_info = Handshake(recv_handshake(dsock))
                 _check_handshake(depth_info, "irtsp-depth")
                 self.depth_info = depth_info
+                self._negotiate_depth(dsock, depth_info)
                 self._spawn(self._depth_loop, dsock, "irtsp-depth")
         except BaseException:
             self.close()  # tear down whatever already started
@@ -282,6 +370,14 @@ class Session:
         self._threads.append(t)
         t.start()
 
+    def _negotiate_depth(self, sock: socket.socket, info: Handshake) -> None:
+        """Opt in to v2 depth compression. Per-connection — rerun after a reconnect."""
+        codec = _choose_depth_codec(info, self.depth_compression)
+        if codec is not None:
+            sock.sendall(_compression_request(codec))
+            log.debug("requested %s depth compression", codec)
+        self.depth_codec = codec
+
     # ------------------------------------------------------------ reader loops
 
     def _record_loop(self, sock: socket.socket) -> None:
@@ -298,10 +394,10 @@ class Session:
                         return
                     sock, last_seq = sock2, None
                     continue
-                # Late joiners: the server replays the latest Intrinsics record
-                # with its ORIGINAL (stale) seq — don't let it baseline the gap
-                # tracker or the first live record shows a huge bogus gap.
-                if last_seq is None and isinstance(record, Intrinsics):
+                # Late joiners: the server replays the latest Intrinsics and SyncModel
+                # records with their ORIGINAL (stale) seq — don't let either baseline the
+                # gap tracker or the first live record shows a huge bogus gap.
+                if last_seq is None and isinstance(record, (Intrinsics, SyncModel)):
                     self._dispatch(record)
                     continue
                 last_seq = self._track_gap(record, last_seq)
@@ -359,6 +455,7 @@ class Session:
                 _check_handshake(handshake, "irtsp-depth" if is_depth else "irtsp-imu")
                 if is_depth:
                     self.depth_info = handshake
+                    self._negotiate_depth(sock, handshake)  # codec is per-connection
                 else:
                     self.info = handshake  # fresh anchors if the app restarted its stream
                 log.info("reconnected to %s:%d", self.host, port)
@@ -438,6 +535,11 @@ class Session:
     @property
     def pose(self) -> RecordStream[Pose]:
         return self.stream(Pose)
+
+    @property
+    def sync(self) -> RecordStream[SyncModel]:
+        """Cross-device clock models — one per re-fit, plus the latest replayed on connect."""
+        return self.stream(SyncModel)
 
     @property
     def depth(self) -> RecordStream[DepthFrame]:
@@ -579,6 +681,7 @@ def connect(
     imu_port: int = 8555,
     depth: bool = False,
     depth_port: int = 8556,
+    depth_compression: str | None = "auto",
     video: bool = False,
     video_url: str | None = None,
     video_auth: tuple[str, str] | None = None,
@@ -593,6 +696,11 @@ def connect(
 
     Args:
         depth: also open the LiDAR depth channel (``phone.depth``).
+        depth_compression: lossless depth compression to negotiate with a v2
+            server — ``"auto"`` (default: lzfse if advertised and the decoder
+            is installed, else zlib, else raw), ``"lzfse"``, ``"zlib"``, or
+            ``"none"``/``None`` for raw. Decoding is always driven by each
+            frame's own flags, and v1 servers are never sent a request.
         video: enable ``phone.frames`` / ``phone.synced()`` (needs ``irtsp[video]``).
         video_url / video_auth: override or authenticate the RTSP URL.
         reconnect: transparently redial if the phone restarts its stream.
@@ -610,6 +718,7 @@ def connect(
         imu_port=imu_port,
         depth=depth,
         depth_port=depth_port,
+        depth_compression=depth_compression,
         video=video,
         video_url=video_url,
         video_auth=video_auth,

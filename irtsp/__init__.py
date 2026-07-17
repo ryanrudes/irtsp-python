@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .clock import StreamClock, interpolate_pose, slerp
+from .clock import KNOWN_TIMEBASES, StreamClock, interpolate_pose, slerp
 from .records import (
     STANDARD_GRAVITY,
     Altitude,
@@ -47,6 +47,8 @@ from .records import (
     RawAccel,
     RawGyro,
     Record,
+    SyncModel,
+    SyncState,
     Tracking,
     TrackingReason,
     Unknown,
@@ -59,7 +61,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .aio import AsyncRecordStream, AsyncSession
     from .discovery import Device
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # Names resolved lazily (PEP 562) so `import irtsp` stays dependency-free and
 # fast, while `irtsp.Device` / `irtsp.AsyncSession` still work at runtime.
@@ -103,6 +105,8 @@ __all__ = [
     "Altitude",
     "Heading",
     "Pose",
+    "SyncModel",
+    "SyncState",
     "DepthFrame",
     "Unknown",
     # value types & constants
@@ -113,6 +117,7 @@ __all__ = [
     "STANDARD_GRAVITY",
     # clock
     "StreamClock",
+    "KNOWN_TIMEBASES",
     "slerp",
     "interpolate_pose",
     # protocol

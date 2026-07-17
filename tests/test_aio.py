@@ -17,6 +17,7 @@ import functools
 import json
 import math
 import struct
+import zlib
 
 import pytest
 
@@ -71,8 +72,13 @@ def depth_message(
     values: list[float],
     host_ts: float = 2.0,
     unix_ts: float = WALL_ANCHOR + 2.0,
+    compress: bool = False,
 ) -> bytes:
-    """One length-prefixed depth-channel frame (u32 LE length + 32B header + f16s)."""
+    """One length-prefixed depth-channel frame (u32 LE length + 32B header + f16s).
+
+    ``compress=True`` sends the samples the v2 "zlib" way: raw DEFLATE payload,
+    flags bit1 set, codec id 2 in header byte 29.
+    """
     assert len(values) == width * height
     header = bytearray(32)
     header[0] = 10  # RecordType.DEPTH
@@ -82,7 +88,13 @@ def depth_message(
     struct.pack_into("<dd", header, 8, host_ts, unix_ts)
     struct.pack_into("<HH", header, 24, width, height)
     header[28] = 2  # bytesPerPixel
-    payload = bytes(header) + b"".join(struct.pack("<e", v) for v in values)
+    samples = b"".join(struct.pack("<e", v) for v in values)
+    if compress:
+        header[1] |= 2  # flags bit1: payload compressed
+        header[29] = 2  # codec id: zlib (raw DEFLATE, RFC 1951)
+        compressor = zlib.compressobj(wbits=-15)
+        samples = compressor.compress(samples) + compressor.flush()
+    payload = bytes(header) + samples
     return struct.pack("<I", len(payload)) + payload
 
 
@@ -143,6 +155,29 @@ def depth_handshake() -> dict:
     }
 
 
+def imu_handshake_v2() -> dict:
+    """The odometry handshake a v2 app sends (state-channel contract added)."""
+    handshake = imu_handshake()
+    handshake["version"] = 2
+    handshake["emission"] = {
+        "imu": "continuous", "gyro": "continuous", "accel": "continuous",
+        "pose": "continuous", "gnss": "event", "altitude": "event",
+        "intrinsics": "state", "heading": "state",
+    }
+    handshake["state_channels"] = {
+        "keyframe_interval_s": 10, "flags": {"bit0": "snapshot_or_keyframe"},
+    }
+    return handshake
+
+
+def depth_handshake_v2(supported: tuple[str, ...] = ("lzfse", "zlib")) -> dict:
+    """The depth handshake a v2 app sends (compression advertised)."""
+    handshake = depth_handshake()
+    handshake["version"] = 2
+    handshake["compression"] = {"supported": list(supported)}
+    return handshake
+
+
 # --------------------------------------------------------------------------- #
 # Scripted server + async plumbing
 # --------------------------------------------------------------------------- #
@@ -160,6 +195,7 @@ class ScriptedServer:
     def __init__(self, handshake: dict):
         self.handshake = handshake
         self.port: int = 0
+        self.received = bytearray()  # client→server bytes (v2 control messages)
         self._server: asyncio.Server | None = None
         self._queue: asyncio.Queue = asyncio.Queue()
 
@@ -175,6 +211,7 @@ class ScriptedServer:
         await self._server.wait_closed()
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        inbox = asyncio.ensure_future(self._collect_client_bytes(reader))
         try:
             blob = json.dumps(self.handshake).encode("utf-8")
             writer.write(struct.pack("<I", len(blob)) + blob)
@@ -188,11 +225,33 @@ class ScriptedServer:
         except (ConnectionError, asyncio.CancelledError):
             pass
         finally:
+            inbox.cancel()
             try:
                 writer.close()
                 await writer.wait_closed()
             except (ConnectionError, OSError):
                 pass
+
+    async def _collect_client_bytes(self, reader: asyncio.StreamReader) -> None:
+        try:
+            while True:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    return
+                self.received += chunk
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+
+    def control_messages(self) -> list[dict]:
+        """Everything the client sent, parsed as [u32 LE length][JSON] messages."""
+        out, offset = [], 0
+        while offset + 4 <= len(self.received):
+            (length,) = struct.unpack_from("<I", self.received, offset)
+            if offset + 4 + length > len(self.received):
+                break
+            out.append(json.loads(bytes(self.received[offset + 4 : offset + 4 + length])))
+            offset += 4 + length
+        return out
 
     def send(self, data: bytes) -> None:
         self._queue.put_nowait(data)
@@ -482,6 +541,66 @@ async def test_depth_channel():
 
                 assert frames[1].seq == 4
                 assert frames[1].gap == 0  # consecutive depth seqs -> no gap
+            finally:
+                await phone.aclose()
+
+
+@async_test
+async def test_handshake_v2_accepted():
+    async with ScriptedServer(imu_handshake_v2()) as server:
+        async with await irtsp.connect_async("127.0.0.1", imu_port=server.port) as phone:
+            assert phone.info is not None
+            assert phone.info.version == 2
+            assert phone.info.emission["intrinsics"] == "state"
+            assert phone.info.state_channels["keyframe_interval_s"] == 10
+            # a v2 session streams exactly like v1
+            stream = phone.imu
+            server.send(imu_record(0))
+            got = await collect(stream, 1)
+            assert got[0].seq == 0
+
+
+@async_test
+async def test_depth_compression_negotiated_and_decoded():
+    async with ScriptedServer(imu_handshake()) as imu_srv:
+        async with ScriptedServer(depth_handshake_v2()) as depth_srv:
+            phone = await irtsp.connect_async(
+                "127.0.0.1", imu_port=imu_srv.port, depth=True,
+                depth_port=depth_srv.port, depth_compression="zlib",
+            )
+            try:
+                assert phone.depth_codec == "zlib"
+                # the exact wire bytes: [u32 LE length][UTF-8 JSON]
+                await eventually(
+                    lambda: depth_srv.control_messages() == [{"compression": "zlib"}],
+                    what="the compression opt-in to arrive",
+                )
+                # a compressed frame and a raw fallback frame both decode —
+                # decoding follows per-frame flags, never the negotiated codec
+                values = [0.25, 0.5, 1.0, 1.5, 2.0, 4.0]
+                stream = phone.depth
+                depth_srv.send(depth_message(1, width=3, height=2, values=values,
+                                             compress=True))
+                depth_srv.send(depth_message(2, width=3, height=2, values=values))
+                frames = await collect(stream, 2)
+                assert frames[0].at(2, 1) == 4.0
+                assert frames[0].data == frames[1].data
+            finally:
+                await phone.aclose()
+
+
+@async_test
+async def test_depth_compression_not_offered_to_v1_server():
+    async with ScriptedServer(imu_handshake()) as imu_srv:
+        async with ScriptedServer(depth_handshake()) as depth_srv:  # v1: no key
+            phone = await irtsp.connect_async(
+                "127.0.0.1", imu_port=imu_srv.port, depth=True,
+                depth_port=depth_srv.port, depth_compression="zlib",
+            )
+            try:
+                assert phone.depth_codec is None
+                await asyncio.sleep(0.2)
+                assert depth_srv.received == b""  # nothing sent, ever
             finally:
                 await phone.aclose()
 

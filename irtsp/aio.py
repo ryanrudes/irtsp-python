@@ -35,8 +35,16 @@ from .records import (
     Intrinsics,
     Pose,
     Record,
+    SyncModel,
 )
-from .session import DEFAULT_BUFFER, Handshake, _check_handshake
+from .session import (
+    DEFAULT_BUFFER,
+    Handshake,
+    _check_depth_compression,
+    _check_handshake,
+    _choose_depth_codec,
+    _compression_request,
+)
 from .wire import (
     MAX_MESSAGE,
     RECORD_SIZE,
@@ -126,11 +134,15 @@ class AsyncSession:
     """A live async connection. Prefer :func:`irtsp.connect_async`."""
 
     def __init__(self, host: str, *, imu_port: int = 8555, depth: bool = False,
-                 depth_port: int = 8556, buffer: int = DEFAULT_BUFFER):
+                 depth_port: int = 8556, depth_compression: str | None = "auto",
+                 buffer: int = DEFAULT_BUFFER):
         self.host = host
         self.imu_port = imu_port
         self.depth_enabled = depth
         self.depth_port = depth_port
+        self.depth_compression = _check_depth_compression(depth_compression)
+        #: Codec negotiated on the current depth connection (``None`` = raw).
+        self.depth_codec: str | None = None
         self._buffer = buffer
 
         self.info: Handshake | None = None
@@ -162,6 +174,12 @@ class AsyncSession:
                 depth_info = await _recv_handshake(dreader)
                 _check_handshake(depth_info, "irtsp-depth")
                 self.depth_info = depth_info
+                # Opt in to v2 depth compression (never on a v1 handshake).
+                codec = _choose_depth_codec(depth_info, self.depth_compression)
+                if codec is not None:
+                    dwriter.write(_compression_request(codec))
+                    await dwriter.drain()
+                self.depth_codec = codec
                 self._tasks.append(
                     asyncio.create_task(self._depth_loop(dreader), name="irtsp-depth")
                 )
@@ -178,9 +196,9 @@ class AsyncSession:
             while True:
                 buf = await reader.readexactly(RECORD_SIZE)
                 record = decode_record(buf)
-                # Server replays the latest Intrinsics (stale seq) to late
-                # joiners — don't let it baseline the gap tracker.
-                if last_seq is None and isinstance(record, Intrinsics):
+                # Server replays the latest Intrinsics and SyncModel (stale seq) to
+                # late joiners — don't let either baseline the gap tracker.
+                if last_seq is None and isinstance(record, (Intrinsics, SyncModel)):
                     self._dispatch(record, None)
                     continue
                 last_seq = self._dispatch(record, last_seq)
@@ -270,6 +288,11 @@ class AsyncSession:
         return self.stream(Pose)
 
     @property
+    def sync(self) -> AsyncRecordStream[SyncModel]:
+        """Cross-device clock models — one per re-fit, plus the latest replayed on connect."""
+        return self.stream(SyncModel)
+
+    @property
     def depth(self) -> AsyncRecordStream[DepthFrame]:
         if not self.depth_enabled:
             raise RuntimeError("depth channel not enabled — connect_async(host, depth=True)")
@@ -340,6 +363,7 @@ async def connect_async(
     imu_port: int = 8555,
     depth: bool = False,
     depth_port: int = 8556,
+    depth_compression: str | None = "auto",
     buffer: int = DEFAULT_BUFFER,
 ) -> AsyncSession:
     """Async twin of :func:`irtsp.connect` (odometry + depth channels)."""
@@ -351,5 +375,6 @@ async def connect_async(
         depth_port = ports.get("depth", depth_port)
     return await AsyncSession(
         host,  # type: ignore[arg-type]
-        imu_port=imu_port, depth=depth, depth_port=depth_port, buffer=buffer
+        imu_port=imu_port, depth=depth, depth_port=depth_port,
+        depth_compression=depth_compression, buffer=buffer,
     ).open()
