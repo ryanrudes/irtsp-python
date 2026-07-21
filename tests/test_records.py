@@ -14,13 +14,20 @@ from irtsp.records import (
     IMU,
     STANDARD_GRAVITY,
     Altitude,
+    Camera,
+    CameraFormat,
+    CapturePath,
     DepthFrame,
     Heading,
     Intrinsics,
     Pose,
+    PTSConvention,
+    PTSProvenance,
     Quat,
     RawAccel,
     RawGyro,
+    ReadoutDirection,
+    ReadoutProvenance,
     Record,
     SyncModel,
     SyncState,
@@ -456,6 +463,48 @@ def test_match_depth_frame() -> None:
             assert (width, height) == (3, 2)
         case _:
             pytest.fail("DepthFrame did not match")
+
+
+def _camera_format(**over) -> CameraFormat:
+    kw = dict(format_id=0x1234ABCD, width=1920, height=1440, fps=30.0,
+              readout_time_s=0.015625, camera=Camera.BACK_WIDE,
+              capture_path=CapturePath.AVCAPTURE,
+              readout_direction=ReadoutDirection.POS_Y,
+              pts_convention=PTSConvention.FIRST_ROW_START,
+              pts_provenance=PTSProvenance.DOCUMENTED,
+              readout_provenance=ReadoutProvenance.PROBED,
+              binned=False, cropped=False)
+    kw.update(over)
+    return CameraFormat(**kw, **COMMON)
+
+
+def test_camera_format_enum_wire_values() -> None:
+    assert (Camera.UNKNOWN, Camera.BACK_WIDE, Camera.BACK_ULTRAWIDE,
+            Camera.BACK_TELE, Camera.FRONT, Camera.BACK_LIDAR) == (0, 1, 2, 3, 4, 5)
+    assert (CapturePath.AVCAPTURE, CapturePath.ARKIT) == (0, 1)
+    assert (ReadoutDirection.UNKNOWN, ReadoutDirection.POS_Y, ReadoutDirection.NEG_Y,
+            ReadoutDirection.POS_X, ReadoutDirection.NEG_X) == (0, 1, 2, 3, 4)
+    assert (PTSConvention.UNKNOWN, PTSConvention.FIRST_ROW_START, PTSConvention.FRAME_CENTER,
+            PTSConvention.LAST_ROW_END, PTSConvention.EXPOSURE_START) == (0, 1, 2, 3, 4)
+    assert (PTSProvenance.UNKNOWN, PTSProvenance.DOCUMENTED, PTSProvenance.MEASURED) == (0, 1, 2)
+    assert (ReadoutProvenance.ABSENT, ReadoutProvenance.PROBED) == (0, 1)
+
+
+def test_camera_format_snapshot_defaults_false_and_is_frozen() -> None:
+    fmt = _camera_format()
+    assert fmt.snapshot is False
+    with pytest.raises(AttributeError):
+        fmt.format_id = 0  # type: ignore[misc]
+
+
+def test_match_camera_format() -> None:
+    match _camera_format(readout_time_s=None):
+        case CameraFormat(format_id, width, height, fps):
+            assert format_id == 0x1234ABCD
+            assert (width, height) == (1920, 1440)
+            assert fps == 30.0
+        case _:
+            pytest.fail("CameraFormat did not match")
 
 
 def test_match_unknown() -> None:

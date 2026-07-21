@@ -392,6 +392,81 @@ def test_snapshot_flag_surfaces_on_state_channels(phone, session):
     assert h_key.snapshot is True
 
 
+# --------------------------------------------- protocol v2.1: camera format channel
+
+
+def test_handshake_v2_1_accepted_without_version_warning(request, caplog):
+    import logging
+
+    phone = MockPhone(version=2, revision=1).start()
+    request.addfinalizer(phone.close)
+    with caplog.at_level(logging.WARNING, logger="irtsp"):
+        with irtsp.connect("127.0.0.1", imu_port=phone.imu_port, timeout=2.0) as session:
+            info = session.info
+            # `version` is UNCHANGED (v2 consumers key off it); revision distinguishes 2.1
+            assert info.version == 2
+            assert info.revision == 1
+            assert info.raw["record_types"]["format"] == 11
+            assert info.emission["format"] == "state"
+            assert info.streams["format"] is True
+            assert info.format_channel  # the descriptive object is surfaced
+            assert "readout_time" in info.format_channel
+    # an unrecognized revision must NOT trip the version warning
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_format_stream_and_latest_end_to_end(request):
+    phone = MockPhone(version=2, revision=1).start()
+    request.addfinalizer(phone.close)
+    with irtsp.connect("127.0.0.1", imu_port=phone.imu_port, timeout=2.0) as session:
+        stream = session.format
+        phone.emit_format(
+            seq=1, snapshot=True, format_id=0xABCD1234, width=1920, height=1440,
+            fps=30.0, readout=0.03125, camera=1, capture_path=0,
+            binned=True, cropped=False,
+        )
+        (fmt,) = collect(stream, 1)
+        assert isinstance(fmt, irtsp.CameraFormat)
+        assert fmt.format_id == 0xABCD1234
+        assert (fmt.width, fmt.height) == (1920, 1440)
+        assert fmt.fps == pytest.approx(30.0)
+        assert fmt.readout_time_s == pytest.approx(0.03125)
+        assert fmt.readout_provenance is irtsp.ReadoutProvenance.PROBED
+        assert fmt.camera is irtsp.Camera.BACK_WIDE
+        assert fmt.capture_path is irtsp.CapturePath.AVCAPTURE
+        assert fmt.binned is True and fmt.cropped is False
+        assert fmt.snapshot is True
+        # and it lands in latest() like any other state channel
+        assert wait_until(lambda: session.latest(irtsp.CameraFormat) is not None)
+        assert session.latest(irtsp.CameraFormat).format_id == 0xABCD1234
+
+
+def test_format_absent_readout_end_to_end(request):
+    phone = MockPhone(version=2, revision=1).start()
+    request.addfinalizer(phone.close)
+    with irtsp.connect("127.0.0.1", imu_port=phone.imu_port, timeout=2.0) as session:
+        stream = session.format
+        phone.emit_format(seq=1, readout=None)  # NaN + provenance absent
+        (fmt,) = collect(stream, 1)
+        assert fmt.readout_time_s is None
+        assert fmt.readout_provenance is irtsp.ReadoutProvenance.ABSENT
+
+
+def test_v2_0_handshake_without_format_keys_still_works(request):
+    # A plain v2.0 server (revision 0): no format channel, but everything else works
+    # exactly as before — the additive 2.1 keys are simply absent.
+    phone = MockPhone(version=2).start()
+    request.addfinalizer(phone.close)
+    with irtsp.connect("127.0.0.1", imu_port=phone.imu_port, timeout=2.0) as session:
+        assert session.info.version == 2
+        assert session.info.revision == 0
+        assert "format" not in session.info.raw.get("record_types", {})
+        assert session.info.format_channel == {}
+        phone.emit_imu(seq=1)
+        (rec,) = collect(session.imu, 1)
+        assert rec.seq == 1
+
+
 # ------------------------------------------- protocol v2: depth compression
 
 

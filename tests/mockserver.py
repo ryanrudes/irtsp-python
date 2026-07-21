@@ -21,6 +21,7 @@ Stdlib only. Typical use::
 from __future__ import annotations
 
 import json
+import math
 import socket
 import struct
 import threading
@@ -40,6 +41,7 @@ T_ALTITUDE = 7
 T_HEADING = 8
 T_POSE = 9
 T_DEPTH = 10
+T_FORMAT = 11
 
 
 def length_prefixed(payload: bytes) -> bytes:
@@ -195,6 +197,7 @@ class MockPhone:
         attitude: bool = True,
         rate_hz: float = 200.0,
         version: int = 1,
+        revision: int = 0,
         depth_codecs: Sequence[str] = ("lzfse", "zlib"),
     ):
         self.host_anchor = host_anchor
@@ -205,6 +208,7 @@ class MockPhone:
         self.attitude = attitude
         self.rate_hz = rate_hz
         self.version = version
+        self.revision = revision  # >=1 (with version>=2) advertises the v2.1 format channel
         self.depth_codecs = list(depth_codecs)  # advertised when version >= 2
         self.streams: dict[str, bool] = dict(streams) if streams is not None else {
             "imu": True,
@@ -301,6 +305,18 @@ class MockPhone:
                 "keyframe_interval_s": 10,
                 "flags": {"bit0": "snapshot_or_keyframe"},
             }
+            if self.revision >= 1:
+                # Protocol 2.1: purely additive — `version` stays 2, a new `revision`
+                # plus the type-11 camera-format channel across the maps.
+                handshake["revision"] = self.revision
+                handshake["record_types"]["format"] = T_FORMAT
+                handshake["emission"]["format"] = "state"
+                handshake["streams"]["format"] = True
+                handshake["format_channel"] = {
+                    "note": "type-11 priors for rolling-shutter (§5.3)",
+                    "readout_time": "per-format constant, probed from .mov metadata",
+                    "pts_convention": "declared, with provenance",
+                }
         return handshake
 
     def _depth_handshake(self) -> dict[str, Any]:
@@ -540,6 +556,54 @@ class MockPhone:
         struct.pack_into("<3f", buf, 24, *position)
         struct.pack_into("<f", buf, 36, float(tracking))
         struct.pack_into("<4f", buf, 48, *quat)
+        self._odo.broadcast(bytes(buf))
+        return seq
+
+    def emit_format(
+        self,
+        *,
+        seq: int | None = None,
+        host_ts: float | None = None,
+        unix_ts: float | None = None,
+        format_id: int = 0x1234ABCD,
+        width: int = 1920,
+        height: int = 1440,
+        fps: float = 30.0,
+        readout: float | None = None,
+        camera: int = 1,
+        capture_path: int = 0,
+        binned: bool = False,
+        cropped: bool = False,
+        readout_direction: int = 1,
+        pts_convention: int = 1,
+        pts_provenance: int = 1,
+        readout_provenance: int | None = None,
+        snapshot: bool = False,
+    ) -> int:
+        """Type 11 camera-format record (protocol v2.1).
+
+        ``readout`` is the full-frame readout time in seconds; ``None`` writes NaN.
+        ``readout_provenance`` defaults to ``probed`` (1) when a readout is given and
+        ``absent`` (0) otherwise — override it to exercise the decoder's edge cases.
+        ``snapshot=True`` sets flags bit0 (state-channel snapshot/keyframe).
+        """
+        seq = self._next_odo_seq(seq)
+        host_ts, unix_ts = self._times(host_ts, unix_ts)
+        readout_time = math.nan if readout is None else readout
+        if readout_provenance is None:
+            readout_provenance = 1 if readout is not None else 0
+        buf = self._record(T_FORMAT, seq, host_ts, unix_ts)
+        buf[1] = 0x01 if snapshot else 0x00
+        struct.pack_into("<I", buf, 24, format_id & 0xFFFFFFFF)
+        struct.pack_into("<HH", buf, 28, width, height)
+        struct.pack_into("<2f", buf, 32, fps, readout_time)
+        buf[40] = camera
+        buf[41] = capture_path
+        buf[42] = (0x01 if binned else 0) | (0x02 if cropped else 0)
+        buf[43] = readout_direction
+        buf[44] = pts_convention
+        buf[45] = pts_provenance
+        buf[46] = readout_provenance
         self._odo.broadcast(bytes(buf))
         return seq
 

@@ -64,6 +64,45 @@ def imu_record(
     return bytes(buf)
 
 
+def format_record(
+    seq: int,
+    *,
+    host_ts: float = 3.0,
+    unix_ts: float = WALL_ANCHOR + 3.0,
+    format_id: int = 0xABCD1234,
+    width: int = 1920,
+    height: int = 1440,
+    fps: float = 30.0,
+    readout_time: float = math.nan,
+    camera: int = 1,
+    capture_path: int = 0,
+    flags2: int = 0,
+    readout_direction: int = 1,
+    pts_convention: int = 1,
+    pts_provenance: int = 1,
+    readout_provenance: int = 0,
+    snapshot: bool = False,
+) -> bytes:
+    """One 64-byte type-11 (camera format) odometry record, little-endian (protocol v2.1)."""
+    buf = bytearray(64)
+    buf[0] = 11  # RecordType.FORMAT
+    buf[1] = 0x01 if snapshot else 0x00
+    struct.pack_into("<H", buf, 2, seq & 0xFFFF)
+    struct.pack_into("<I", buf, 4, 0)  # reserved
+    struct.pack_into("<dd", buf, 8, host_ts, unix_ts)
+    struct.pack_into("<I", buf, 24, format_id)
+    struct.pack_into("<HH", buf, 28, width, height)
+    struct.pack_into("<2f", buf, 32, fps, readout_time)
+    buf[40] = camera
+    buf[41] = capture_path
+    buf[42] = flags2
+    buf[43] = readout_direction
+    buf[44] = pts_convention
+    buf[45] = pts_provenance
+    buf[46] = readout_provenance
+    return bytes(buf)
+
+
 def depth_message(
     seq: int,
     *,
@@ -175,6 +214,17 @@ def depth_handshake_v2(supported: tuple[str, ...] = ("lzfse", "zlib")) -> dict:
     handshake = depth_handshake()
     handshake["version"] = 2
     handshake["compression"] = {"supported": list(supported)}
+    return handshake
+
+
+def imu_handshake_v2_1() -> dict:
+    """The odometry handshake a v2.1 app sends (adds the type-11 format channel)."""
+    handshake = imu_handshake_v2()
+    handshake["revision"] = 1  # version stays 2; revision distinguishes the point release
+    handshake["record_types"]["format"] = 11
+    handshake["emission"]["format"] = "state"
+    handshake["streams"]["format"] = True
+    handshake["format_channel"] = {"note": "type-11 priors for rolling-shutter (§5.3)"}
     return handshake
 
 
@@ -558,6 +608,24 @@ async def test_handshake_v2_accepted():
             server.send(imu_record(0))
             got = await collect(stream, 1)
             assert got[0].seq == 0
+
+
+@async_test
+async def test_format_channel_v2_1_accepted_and_streamed():
+    async with ScriptedServer(imu_handshake_v2_1()) as server:
+        async with await irtsp.connect_async("127.0.0.1", imu_port=server.port) as phone:
+            assert phone.info.version == 2  # unchanged
+            assert phone.info.revision == 1
+            assert phone.info.format_channel  # surfaced descriptor
+            stream = phone.format
+            server.send(format_record(1, format_id=0xABCD1234, readout_time=0.03125,
+                                      readout_provenance=1, snapshot=True))
+            got = await collect(stream, 1)
+            assert isinstance(got[0], irtsp.CameraFormat)
+            assert got[0].format_id == 0xABCD1234
+            assert got[0].readout_time_s == pytest.approx(0.03125)
+            assert got[0].snapshot is True
+            assert phone.latest(irtsp.CameraFormat).format_id == 0xABCD1234
 
 
 @async_test

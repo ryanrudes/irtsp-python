@@ -37,15 +37,22 @@ from .clock import KNOWN_TIMEBASES, StreamClock, interpolate_pose, slerp
 from .records import (
     STANDARD_GRAVITY,
     Altitude,
+    Camera,
+    CameraFormat,
+    CapturePath,
     DepthFrame,
     GNSS,
     Heading,
     IMU,
     Intrinsics,
     Pose,
+    PTSConvention,
+    PTSProvenance,
     Quat,
     RawAccel,
     RawGyro,
+    ReadoutDirection,
+    ReadoutProvenance,
     Record,
     SyncModel,
     SyncState,
@@ -61,7 +68,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .aio import AsyncRecordStream, AsyncSession
     from .discovery import Device
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # Names resolved lazily (PEP 562) so `import irtsp` stays dependency-free and
 # fast, while `irtsp.Device` / `irtsp.AsyncSession` still work at runtime.
@@ -108,12 +115,19 @@ __all__ = [
     "SyncModel",
     "SyncState",
     "DepthFrame",
+    "CameraFormat",
     "Unknown",
     # value types & constants
     "Vec3",
     "Quat",
     "Tracking",
     "TrackingReason",
+    "Camera",
+    "CapturePath",
+    "ReadoutDirection",
+    "PTSConvention",
+    "PTSProvenance",
+    "ReadoutProvenance",
     "STANDARD_GRAVITY",
     # clock
     "StreamClock",

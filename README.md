@@ -75,6 +75,7 @@ iterator** with its own buffer — create as many as you like, they don't compet
 | `Altitude` | `phone.altitude` | ~1 Hz | `relative_altitude` m · `pressure` **Pa** | `pressure_kpa`, `pressure_hpa` |
 | `Heading` | `phone.heading` | on-change, capped ~1 Hz, + 10 s keyframes (v2) | `true_deg` · `magnetic_deg` · `accuracy_deg` · `snapshot` | `true_rad`, `magnetic_rad` |
 | `Pose` | `phone.pose` | ~60 Hz (AR mode) | `position` m (gravity-aligned world frame) · `orientation` quat · `tracking` · `discontinuity`/`relocalized`/`jump` · `gravity_tilt_deg` · `is_level()` | `gravity_tilt_rad`, `gravity_world` |
+| `CameraFormat` | `phone.format` | on format change, + snapshot on connect & 10 s keyframes (v2.1) | rolling-shutter priors: `format_id` · `width`×`height` · `fps` · `readout_time_s` (`None` if absent) · `camera` · `capture_path` · `readout_direction` · `pts_convention`/`pts_provenance` · `readout_provenance` · `binned`/`cropped` · `snapshot` | — |
 | `DepthFrame` | `phone.depth` | ≤ 30 Hz | half-float **meters**; `meters` (ndarray), `at(x, y)`, `point_cloud(K)` | — |
 
 Unit conventions, in one breath: SI everywhere by default — the wire's g-units become

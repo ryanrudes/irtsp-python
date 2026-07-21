@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, TypeVar
 from .clock import StreamClock
 from .records import (
     Altitude,
+    CameraFormat,
     DepthFrame,
     GNSS,
     Heading,
@@ -91,6 +92,10 @@ class Handshake:
         self.raw: dict[str, Any] = dict(raw)
         self.protocol: str = str(raw.get("protocol", ""))
         self.version: int = int(raw.get("version", 1))
+        #: Additive point-release within :attr:`version` (protocol "2.1" == ``revision 1``);
+        #: 0 (or absent) on plain v2 / v1 servers. A revision this client doesn't recognize
+        #: is safe to ignore — only a higher ``version`` warns.
+        self.revision: int = int(raw.get("revision", 0))
         self.record_bytes: int = int(raw.get("record_bytes", RECORD_SIZE))
         self.clock: StreamClock = StreamClock.from_handshake(raw)
         #: Which optional streams this session has enabled, e.g. ``{"gnss": True, ...}``.
@@ -100,6 +105,9 @@ class Handshake:
         self.emission: dict[str, str] = dict(raw.get("emission", {}) or {})
         #: The v2 state-channel contract (``keyframe_interval_s`` etc.); empty on v1.
         self.state_channels: dict[str, Any] = dict(raw.get("state_channels", {}) or {})
+        #: The v2.1 camera-format channel descriptor (type-11 rolling-shutter priors);
+        #: empty unless the server advertises the ``format`` channel (``revision >= 1``).
+        self.format_channel: dict[str, Any] = dict(raw.get("format_channel", {}) or {})
         video = raw.get("video", {}) or {}
         self.video_url: str | None = video.get("rtsp_url")
         self.video_codec: str | None = video.get("codec")
@@ -394,10 +402,10 @@ class Session:
                         return
                     sock, last_seq = sock2, None
                     continue
-                # Late joiners: the server replays the latest Intrinsics and SyncModel
-                # records with their ORIGINAL (stale) seq — don't let either baseline the
-                # gap tracker or the first live record shows a huge bogus gap.
-                if last_seq is None and isinstance(record, (Intrinsics, SyncModel)):
+                # Late joiners: the server replays the latest Intrinsics, SyncModel and
+                # CameraFormat records with their ORIGINAL (stale) seq — don't let any of
+                # them baseline the gap tracker or the first live record shows a huge bogus gap.
+                if last_seq is None and isinstance(record, (Intrinsics, SyncModel, CameraFormat)):
                     self._dispatch(record)
                     continue
                 last_seq = self._track_gap(record, last_seq)
@@ -535,6 +543,12 @@ class Session:
     @property
     def pose(self) -> RecordStream[Pose]:
         return self.stream(Pose)
+
+    @property
+    def format(self) -> RecordStream[CameraFormat]:
+        """Camera-format / rolling-shutter fingerprints (v2.1) — snapshot on connect,
+        keyframes every ~10 s, and a re-emit whenever the capture mode changes."""
+        return self.stream(CameraFormat)
 
     @property
     def sync(self) -> RecordStream[SyncModel]:

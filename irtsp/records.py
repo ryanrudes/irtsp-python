@@ -52,6 +52,13 @@ __all__ = [
     "SyncState",
     "SyncModel",
     "DepthFrame",
+    "Camera",
+    "CapturePath",
+    "ReadoutDirection",
+    "PTSConvention",
+    "PTSProvenance",
+    "ReadoutProvenance",
+    "CameraFormat",
     "Unknown",
 ]
 
@@ -202,6 +209,88 @@ class SyncState(IntEnum):
     NOT_CONVERGED = 0
     OFFSET_ONLY = 1
     CONVERGED = 2
+
+
+class Camera(IntEnum):
+    """Which physical camera a :class:`CameraFormat` describes.
+
+    An unrecognized wire value decodes to :attr:`UNKNOWN` — a camera this
+    client doesn't know about must never masquerade as a known one.
+    """
+
+    UNKNOWN = 0
+    BACK_WIDE = 1
+    BACK_ULTRAWIDE = 2
+    BACK_TELE = 3
+    FRONT = 4
+    BACK_LIDAR = 5
+
+
+class CapturePath(IntEnum):
+    """The pipeline delivering the frames: plain AVCapture, or ARKit.
+
+    On the ARKit path the image is delivered sensor-native (un-rotated), so
+    readout runs ``+Y``. An unrecognized wire value decodes to :attr:`AVCAPTURE`.
+    """
+
+    AVCAPTURE = 0
+    ARKIT = 1
+
+
+class ReadoutDirection(IntEnum):
+    """Which **delivered-image** axis the sensor's row readout runs along.
+
+    The one field a rolling-shutter consumer cannot recover downstream: only the
+    app knows the rotation it applied from sensor-native rows onto the delivered
+    buffer. Directions are in delivered-image coordinates (after that rotation).
+    An unrecognized wire value decodes to :attr:`UNKNOWN`.
+    """
+
+    UNKNOWN = 0
+    POS_Y = 1  #: +Y (top → bottom)
+    NEG_Y = 2  #: -Y (bottom → top)
+    POS_X = 3  #: +X (left → right)
+    NEG_X = 4  #: -X (right → left)
+
+
+class PTSConvention(IntEnum):
+    """What instant a frame's PTS denotes, relative to the readout window.
+
+    The anchor for the row-time model ``t(row) = t_frame + Δt + α(row)·t_r``.
+    An unrecognized wire value decodes to :attr:`UNKNOWN`.
+    """
+
+    UNKNOWN = 0
+    FIRST_ROW_START = 1
+    FRAME_CENTER = 2
+    LAST_ROW_END = 3
+    EXPOSURE_START = 4
+
+
+class PTSProvenance(IntEnum):
+    """How the :class:`PTSConvention` was established.
+
+    :attr:`DOCUMENTED` is a declared default from Apple's docs / the pipeline —
+    **not** an on-device measurement; :attr:`MEASURED` was characterized on-device
+    with the gyro rolling-shutter method. An unrecognized value → :attr:`UNKNOWN`.
+    """
+
+    UNKNOWN = 0
+    DOCUMENTED = 1
+    MEASURED = 2
+
+
+class ReadoutProvenance(IntEnum):
+    """Whether a full-frame readout time is available for this format.
+
+    :attr:`ABSENT` is a valid, non-degraded state — "no prior", not "degraded";
+    the readout time then reads as ``None``. :attr:`PROBED` means it was recorded
+    from ``.mov`` metadata for this exact format. An unrecognized value →
+    :attr:`ABSENT` (fail safe: no value without a provenance that vouches for it).
+    """
+
+    ABSENT = 0
+    PROBED = 1
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -604,6 +693,49 @@ class DepthFrame(Record):
         y = (ys - k.cy) * z / k.fy
         pts = np.stack([x, y, z], axis=-1).reshape(-1, 3)
         return pts[np.isfinite(pts).all(axis=1)].astype(np.float32)
+
+
+@dataclass(frozen=True, kw_only=True, slots=True, match_args=False)
+class CameraFormat(Record):
+    """Camera format / rolling-shutter fingerprint (wire type 11, protocol v2.1).
+
+    A **state channel** (like :class:`Intrinsics`): a snapshot on connect, a
+    keyframe every ~10 s, and an immediate re-emit if the capture mode changes —
+    so :meth:`irtsp.Session.latest` almost always has one. Everything here is a
+    **prior** to key your own rolling-shutter calibration off, never ground
+    truth; calibrate readout time and the PTS convention yourself.
+
+    A mid-session :attr:`format_id` change is a take-validity event: iRTSP pins a
+    single physical camera while odometry is up, so the format is normally stable
+    and this record is quiet. If it *does* change, the sensor mode changed under
+    you — re-key, don't treat it as a routine update.
+    """
+
+    __match_args__: ClassVar[tuple[str, ...]] = ("format_id", "width", "height", "fps")
+
+    format_id: int  #: stable fingerprint of the capture mode; changes iff the format does
+    width: int  #: delivered pixels (what the RTP video carries)
+    height: int
+    fps: float  #: frames/sec (from ``videoMinFrameDuration``)
+    #: Full-frame readout duration in seconds, or ``None`` when absent — either the
+    #: wire value was NaN or :attr:`readout_provenance` is ``ABSENT``. Absent is a
+    #: valid, non-degraded "no prior" state, not a degraded reading.
+    readout_time_s: float | None
+    camera: Camera  #: which physical camera
+    capture_path: CapturePath  #: AVCapture vs ARKit pipeline
+    #: Which delivered-image axis the row readout runs along — the one quantity a
+    #: consumer cannot reconstruct itself (see :class:`ReadoutDirection`).
+    readout_direction: ReadoutDirection
+    pts_convention: PTSConvention  #: what instant a frame's PTS denotes
+    pts_provenance: PTSProvenance  #: how that convention was established
+    readout_provenance: ReadoutProvenance  #: whether the readout time is a real prior
+    binned: bool  #: sensor pixel binning is active
+    cropped: bool  #: the delivered frame is a sensor crop
+    #: True for a snapshot/keyframe (wire flags bit0): the current state
+    #: re-asserted, stamped at send time. False for a real change event, which
+    #: carries the sensor's own timestamp. If you only care about the value,
+    #: ignore it.
+    snapshot: bool = False
 
 
 @dataclass(frozen=True, kw_only=True, slots=True, match_args=False)

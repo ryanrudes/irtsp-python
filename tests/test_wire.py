@@ -37,13 +37,20 @@ from irtsp.records import (
     IMU,
     STANDARD_GRAVITY,
     Altitude,
+    Camera,
+    CameraFormat,
+    CapturePath,
     DepthFrame,
     Heading,
     Intrinsics,
     Pose,
+    PTSConvention,
+    PTSProvenance,
     Quat,
     RawAccel,
     RawGyro,
+    ReadoutDirection,
+    ReadoutProvenance,
     SyncModel,
     SyncState,
     Tracking,
@@ -784,6 +791,148 @@ def test_record_type_enum_matches_swift_ids() -> None:
     assert RecordType.POSE == 9
     assert RecordType.DEPTH == 10
     assert RecordType.SYNC == 10  # channel-overloaded twin of DEPTH
+    assert RecordType.FORMAT == 11
+
+
+# --------------------------------------------------------------------------- #
+# Type 11: camera format / rolling-shutter fingerprint (protocol v2.1)
+#
+#   24 u32 format_id  28 u16 width  30 u16 height  32 f32 fps
+#   36 f32 readout_time_s (NaN = absent)  40 u8 camera  41 u8 capture_path
+#   42 u8 flags2 (bit0 binned, bit1 cropped)  43 u8 readout_direction
+#   44 u8 pts_convention  45 u8 pts_provenance  46 u8 readout_provenance
+# --------------------------------------------------------------------------- #
+
+
+def make_format(*, format_id: int = 0x1234ABCD, width: int = 1920, height: int = 1440,
+                fps: float = 30.0, readout_time: float = math.nan, camera: int = 1,
+                capture_path: int = 0, flags2: int = 0, readout_direction: int = 1,
+                pts_convention: int = 1, pts_provenance: int = 1,
+                readout_provenance: int = 0, flags: int = 0, seq: int = SEQ) -> bytes:
+    buf = make_header(11, seq=seq, flags=flags)
+    struct.pack_into("<I", buf, 24, format_id)
+    struct.pack_into("<HH", buf, 28, width, height)
+    struct.pack_into("<2f", buf, 32, fps, readout_time)
+    buf[40] = camera
+    buf[41] = capture_path
+    buf[42] = flags2
+    buf[43] = readout_direction
+    buf[44] = pts_convention
+    buf[45] = pts_provenance
+    buf[46] = readout_provenance
+    return bytes(buf)
+
+
+def test_format_record_golden() -> None:
+    # A probed AVCapture back-wide format with a real readout time (1/64 s is exact in f32).
+    buf = make_format(format_id=0x1234ABCD, width=1920, height=1440, fps=30.0,
+                      readout_time=0.015625, camera=1, capture_path=0, flags2=0,
+                      readout_direction=1, pts_convention=1, pts_provenance=1,
+                      readout_provenance=1)
+    rec = decode_record(buf)
+    assert type(rec) is CameraFormat
+    assert_common(rec)
+    assert rec.format_id == 0x1234ABCD
+    assert rec.width == 1920 and isinstance(rec.width, int)
+    assert rec.height == 1440 and isinstance(rec.height, int)
+    assert rec.fps == 30.0
+    assert rec.readout_time_s == pytest.approx(0.015625)
+    assert rec.camera is Camera.BACK_WIDE
+    assert rec.capture_path is CapturePath.AVCAPTURE
+    assert rec.readout_direction is ReadoutDirection.POS_Y
+    assert rec.pts_convention is PTSConvention.FIRST_ROW_START
+    assert rec.pts_provenance is PTSProvenance.DOCUMENTED
+    assert rec.readout_provenance is ReadoutProvenance.PROBED
+    assert rec.binned is False and rec.cropped is False
+    assert rec.snapshot is False  # flags 0 = a real change event
+
+
+def test_format_snapshot_flag() -> None:
+    # flags bit0 (v2 state channels) = snapshot/keyframe, stamped at send time
+    assert decode_record(make_format(flags=0x01)).snapshot is True
+    assert decode_record(make_format(flags=0x00)).snapshot is False
+    # other flag bits set, bit0 clear -> still a change event (forward compat)
+    assert decode_record(make_format(flags=0xFE)).snapshot is False
+
+
+def test_format_readout_present_when_probed() -> None:
+    rec = decode_record(make_format(readout_time=0.03125, readout_provenance=1))
+    assert rec.readout_time_s == pytest.approx(0.03125)
+    assert rec.readout_provenance is ReadoutProvenance.PROBED
+
+
+def test_format_readout_absent_when_nan() -> None:
+    # NaN readout -> None, regardless of the provenance byte claiming 'probed'
+    rec = decode_record(make_format(readout_time=math.nan, readout_provenance=1))
+    assert rec.readout_time_s is None
+
+
+def test_format_readout_absent_when_provenance_absent() -> None:
+    # A finite value with provenance 'absent' is still None — never read a value
+    # the provenance does not vouch for.
+    rec = decode_record(make_format(readout_time=0.02, readout_provenance=0))
+    assert rec.readout_time_s is None
+    assert rec.readout_provenance is ReadoutProvenance.ABSENT
+
+
+def test_format_flags2_binned_cropped() -> None:
+    assert (decode_record(make_format(flags2=0x00)).binned,
+            decode_record(make_format(flags2=0x00)).cropped) == (False, False)
+    r = decode_record(make_format(flags2=0x01))
+    assert (r.binned, r.cropped) == (True, False)
+    r = decode_record(make_format(flags2=0x02))
+    assert (r.binned, r.cropped) == (False, True)
+    r = decode_record(make_format(flags2=0x03))
+    assert (r.binned, r.cropped) == (True, True)
+    # unknown high bits are ignored, bits 0/1 still decode
+    r = decode_record(make_format(flags2=0xFF))
+    assert (r.binned, r.cropped) == (True, True)
+
+
+@pytest.mark.parametrize(
+    ("wire", "expected"),
+    [(0, Camera.UNKNOWN), (1, Camera.BACK_WIDE), (2, Camera.BACK_ULTRAWIDE),
+     (3, Camera.BACK_TELE), (4, Camera.FRONT), (5, Camera.BACK_LIDAR),
+     (99, Camera.UNKNOWN)],  # a future camera degrades, never raises
+)
+def test_format_camera_enum(wire: int, expected: Camera) -> None:
+    assert decode_record(make_format(camera=wire)).camera is expected
+
+
+def test_format_arkit_path_is_delivered_unrotated() -> None:
+    # capture_path=1 (ARKit) delivers sensor-native landscape, so readout is +Y.
+    rec = decode_record(make_format(capture_path=1, readout_direction=1))
+    assert rec.capture_path is CapturePath.ARKIT
+    assert rec.readout_direction is ReadoutDirection.POS_Y
+
+
+def test_format_unknown_enum_ints_fall_back_safely() -> None:
+    rec = decode_record(make_format(
+        camera=200, capture_path=200, readout_direction=200,
+        pts_convention=200, pts_provenance=200,
+        readout_time=0.02, readout_provenance=200,
+    ))
+    assert rec.camera is Camera.UNKNOWN
+    assert rec.capture_path is CapturePath.AVCAPTURE
+    assert rec.readout_direction is ReadoutDirection.UNKNOWN
+    assert rec.pts_convention is PTSConvention.UNKNOWN
+    assert rec.pts_provenance is PTSProvenance.UNKNOWN
+    # provenance falls back to ABSENT, which in turn nulls the readout value
+    assert rec.readout_provenance is ReadoutProvenance.ABSENT
+    assert rec.readout_time_s is None
+
+
+def test_format_preserves_64_byte_stride() -> None:
+    # A reader that skips CameraFormat still reads the next record: uniform stride.
+    fmt = make_format(seq=SEQ)
+    imu = make_header(1, seq=SEQ + 1)
+    struct.pack_into("<10f", imu, 24, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    stream = fmt + bytes(imu)
+    recs = [decode_record(stream[i:i + RECORD_SIZE])
+            for i in range(0, len(stream), RECORD_SIZE)]
+    assert isinstance(recs[0], CameraFormat)
+    assert isinstance(recs[1], IMU)
+    assert recs[1].seq == SEQ + 1
 
 
 # --------------------------------------------------------------------------- #

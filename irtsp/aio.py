@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar
 from .clock import StreamClock
 from .records import (
     Altitude,
+    CameraFormat,
     DepthFrame,
     GNSS,
     Heading,
@@ -196,9 +197,9 @@ class AsyncSession:
             while True:
                 buf = await reader.readexactly(RECORD_SIZE)
                 record = decode_record(buf)
-                # Server replays the latest Intrinsics and SyncModel (stale seq) to
-                # late joiners — don't let either baseline the gap tracker.
-                if last_seq is None and isinstance(record, (Intrinsics, SyncModel)):
+                # Server replays the latest Intrinsics, SyncModel and CameraFormat
+                # (stale seq) to late joiners — don't let any baseline the gap tracker.
+                if last_seq is None and isinstance(record, (Intrinsics, SyncModel, CameraFormat)):
                     self._dispatch(record, None)
                     continue
                 last_seq = self._dispatch(record, last_seq)
@@ -286,6 +287,12 @@ class AsyncSession:
     @property
     def pose(self) -> AsyncRecordStream[Pose]:
         return self.stream(Pose)
+
+    @property
+    def format(self) -> AsyncRecordStream[CameraFormat]:
+        """Camera-format / rolling-shutter fingerprints (v2.1) — snapshot on connect,
+        keyframes every ~10 s, and a re-emit whenever the capture mode changes."""
+        return self.stream(CameraFormat)
 
     @property
     def sync(self) -> AsyncRecordStream[SyncModel]:

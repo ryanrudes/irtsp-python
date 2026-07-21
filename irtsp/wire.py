@@ -30,15 +30,22 @@ from typing import Any
 from .records import (
     STANDARD_GRAVITY,
     Altitude,
+    Camera,
+    CameraFormat,
+    CapturePath,
     DepthFrame,
     GNSS,
     Heading,
     IMU,
     Intrinsics,
     Pose,
+    PTSConvention,
+    PTSProvenance,
     Quat,
     RawAccel,
     RawGyro,
+    ReadoutDirection,
+    ReadoutProvenance,
     Record,
     SyncModel,
     SyncState,
@@ -89,6 +96,7 @@ class RecordType(IntEnum):
     # channel. Each decoder only sees its own channel's bytes, so the reuse is unambiguous
     # on the wire; SYNC is an alias of DEPTH here (same numeric code, kept usable by name).
     SYNC = 10  # odometry channel only — cross-device clock model (SyncModel)
+    FORMAT = 11  # camera format / rolling-shutter fingerprint (protocol v2.1)
 
 
 class ProtocolError(ValueError):
@@ -144,6 +152,19 @@ def recv_handshake(sock: socket.socket) -> dict[str, Any]:
 def _optional(value: float) -> float | None:
     """CoreLocation encodes 'invalid' as a negative value."""
     return None if value < 0 else value
+
+
+def _enum_or(enum_cls: type, value: int, fallback: Any) -> Any:
+    """Decode a wire byte to ``enum_cls``, falling back for values we don't know.
+
+    Like :class:`TrackingReason`/:class:`SyncState`'s unknown handling: a value a
+    newer app introduced must degrade to a safe member (``unknown``/``absent``),
+    never raise.
+    """
+    try:
+        return enum_cls(value)
+    except ValueError:
+        return fallback
 
 
 def decode_record(buf: bytes | bytearray | memoryview) -> Record:
@@ -254,6 +275,39 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
             reason=(TrackingReason(buf[4]) if buf[4] in _REASONS else TrackingReason.UNKNOWN),
             gravity_tilt_deg=tilt,
             gravity_azimuth_deg=azimuth,
+            **common,
+        )
+
+    if type_id == RecordType.FORMAT:
+        # Camera format / rolling-shutter fingerprint (protocol v2.1), little-endian:
+        #   24 u32 format_id  28 u16 width  30 u16 height  32 f32 fps
+        #   36 f32 readout_time_s (NaN = absent)  40 u8 camera  41 u8 capture_path
+        #   42 u8 flags2 (bit0 binned, bit1 cropped)  43 u8 readout_direction
+        #   44 u8 pts_convention  45 u8 pts_provenance  46 u8 readout_provenance
+        (format_id,) = struct.unpack_from("<I", buf, 24)
+        width, height = struct.unpack_from("<HH", buf, 28)
+        fps, readout_time = struct.unpack_from("<2f", buf, 32)
+        flags2 = buf[42]
+        provenance = _enum_or(ReadoutProvenance, buf[46], ReadoutProvenance.ABSENT)
+        # A readout time only counts if it is finite AND a provenance vouches for it;
+        # NaN or 'absent' both mean "no prior" (a valid, non-degraded state) -> None.
+        no_readout = math.isnan(readout_time) or provenance is ReadoutProvenance.ABSENT
+        return CameraFormat(
+            format_id=format_id,
+            width=width,
+            height=height,
+            fps=fps,
+            readout_time_s=None if no_readout else readout_time,
+            camera=_enum_or(Camera, buf[40], Camera.UNKNOWN),
+            capture_path=_enum_or(CapturePath, buf[41], CapturePath.AVCAPTURE),
+            readout_direction=_enum_or(ReadoutDirection, buf[43], ReadoutDirection.UNKNOWN),
+            pts_convention=_enum_or(PTSConvention, buf[44], PTSConvention.UNKNOWN),
+            pts_provenance=_enum_or(PTSProvenance, buf[45], PTSProvenance.UNKNOWN),
+            readout_provenance=provenance,
+            binned=bool(flags2 & 0x01),
+            cropped=bool(flags2 & 0x02),
+            # flags bit0 (v2 state channels): snapshot/keyframe, stamped at send time
+            snapshot=bool(buf[1] & 0x01),
             **common,
         )
 
