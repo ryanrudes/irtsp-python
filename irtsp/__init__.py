@@ -68,7 +68,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .aio import AsyncRecordStream, AsyncSession
     from .discovery import Device
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 # Names resolved lazily (PEP 562) so `import irtsp` stays dependency-free and
 # fast, while `irtsp.Device` / `irtsp.AsyncSession` still work at runtime.

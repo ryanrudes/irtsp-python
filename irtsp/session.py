@@ -108,6 +108,11 @@ class Handshake:
         #: The v2.1 camera-format channel descriptor (type-11 rolling-shutter priors);
         #: empty unless the server advertises the ``format`` channel (``revision >= 1``).
         self.format_channel: dict[str, Any] = dict(raw.get("format_channel", {}) or {})
+        #: The v2.2 report of what capture processing was actually configured
+        #: (``{"audio": {...}, "video": {...}}``); empty unless ``revision >= 2``.
+        #: Lets you *verify* the session rather than assume — but note it is not a
+        #: hardware readback: a knob the device doesn't support silently no-ops.
+        self.capture_settings: dict[str, Any] = dict(raw.get("capture_settings", {}) or {})
         video = raw.get("video", {}) or {}
         self.video_url: str | None = video.get("rtsp_url")
         self.video_codec: str | None = video.get("codec")

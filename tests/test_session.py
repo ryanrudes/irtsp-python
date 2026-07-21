@@ -651,3 +651,34 @@ def test_video_url_override_wins(phone):
         video_url="rtsp://elsewhere:1234/x", timeout=2.0,
     ) as session:
         assert session.video_url == "rtsp://elsewhere:1234/x"
+
+
+# --------------------------------------------------------------------------- #
+# capture_settings (protocol 2.2 / handshake revision 2)
+# --------------------------------------------------------------------------- #
+
+
+def test_capture_settings_exposed_at_revision_2() -> None:
+    """revision 2 reports what capture processing was actually configured."""
+    info = irtsp.Handshake(
+        {
+            "protocol": "irtsp-imu",
+            "version": 2,
+            "revision": 2,
+            "capture_settings": {
+                "audio": {"codec": "opus", "session_mode": "measurement", "channels": 2},
+                "video": {"stabilization": "off", "geometric_distortion_correction": False},
+            },
+        }
+    )
+    assert info.revision == 2
+    assert info.capture_settings["audio"]["codec"] == "opus"
+    assert info.capture_settings["audio"]["session_mode"] == "measurement"
+    assert info.capture_settings["video"]["geometric_distortion_correction"] is False
+
+
+def test_capture_settings_absent_on_older_revisions() -> None:
+    """A 2.0/2.1 server sends no capture_settings — that's empty, not an error."""
+    for revision in (0, 1):
+        info = irtsp.Handshake({"protocol": "irtsp-imu", "version": 2, "revision": revision})
+        assert info.capture_settings == {}
