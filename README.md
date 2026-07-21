@@ -18,7 +18,7 @@ is pure stdlib, Python ≥ 3.10.
 | Command | What you get |
 |---|---|
 | `pip install irtsp` | The core client — odometry + depth channels, all record types. Zero dependencies. |
-| `pip install "irtsp[numpy]"` | `DepthFrame.meters` arrays and `point_cloud()` back-projection. |
+| `pip install "irtsp[numpy]"` | `DepthFrame.meters` arrays, `point_cloud()` back-projection, `AudioBlock.samples`. |
 | `pip install "irtsp[discovery]"` | `irtsp.discover()` — find phones over Bonjour/mDNS (zeroconf). |
 | `pip install "irtsp[video]"` | Decoded video frames + `synced()` bundles (PyAV + numpy). **Experimental.** |
 | `pip install "irtsp[all]"` | Everything above. |
@@ -211,6 +211,47 @@ with irtsp.connect("192.168.1.24", depth=True) as phone:
 the video) and rescales them to the depth map automatically. The camera frame is the
 standard pinhole convention: +X right, +Y down, +Z forward. Non-finite depths are
 dropped.
+
+## Raw RTP audio — with the capture gaps left visible
+
+`irtsp.audio_stream()` reads the microphone track straight off RTSP and hands you
+**contiguous blocks** instead of a dense array of samples:
+
+```python
+import irtsp                       # pip install "irtsp[numpy]" for .samples
+
+with irtsp.audio_stream("192.168.1.24") as audio:
+    for block in audio:
+        block.samples        # (n, channels) int16 — L16, decoded big-endian → native
+        block.rtp_timestamp  # RTP ticks of block.samples[0] — this block's anchor
+        block.gap_frames     # frames of capture missing right before this block
+        block.lost_packets   # packets the phone never sent — a different problem
+
+    for rtp, unix in audio.sender_reports:   # RTCP SR pairs, no ffmpeg in the way
+        anchor(rtp, unix)
+```
+
+**Why this is not just `ffmpeg -i … out.wav`.** A WAV file is dense, so reading one
+back you can only assume sample *n* was captured at `anchor + n / rate`. iRTSP
+deliberately breaks that assumption when it must: if the microphone capture stalls,
+the app re-anchors to the *true* capture time rather than pretending the missing
+audio happened — a real hole in the timeline, with the RTP marker bit on the first
+packet after it. FFmpeg conceals the hole; this reader measures it. `gap_frames` is
+exact (`Δtimestamp − frames in the preceding packet`), and *inside* a block sample
+*n* really was captured at `rtp_timestamp + n` ticks. Across blocks, nothing is
+assumed on your behalf.
+
+`gap_frames` and `lost_packets` are never summed: a hole in capture and a packet the
+phone dropped have different causes and different remedies. Timestamps are unwrapped
+past the 32-bit RTP rollover — RFC 3550 randomizes the base, so a wrap can land
+minutes into a run rather than once a day — which makes `rtp_timestamp` monotonic
+64-bit, with the wire value still on `rtp_timestamp_raw`.
+
+Scope is deliberately narrow: the **audio track only**, **TCP-interleaved only** (no
+UDP — TCP removes transit loss and makes framing deterministic), and **L16** is the
+path it is built for. AAC and Opus stream fine, with the raw payloads on
+`block.packets` for your own decoder and `samples is None`; an AAC marker bit means
+end-of-access-unit and is never read as a gap. Basic and Digest auth both work.
 
 ## Video + `synced()` — EXPERIMENTAL
 

@@ -1,13 +1,18 @@
-"""A threaded TCP mock of an iRTSP phone's two side-channels, for tests.
+"""Threaded TCP mocks of an iRTSP phone's servers, for tests.
 
-Byte-faithful to the app's servers (``IMUStreamServer.swift`` /
-``DepthStreamServer.swift`` / ``IMUWireFormat.swift``):
+:class:`MockPhone` is the two side-channels, byte-faithful to the app's servers
+(``IMUStreamServer.swift`` / ``DepthStreamServer.swift`` / ``IMUWireFormat.swift``):
 
 * On connect, each channel sends ``[u32 LE length][UTF-8 JSON handshake]``.
 * The **odometry** channel then streams back-to-back fixed 64-byte
   little-endian records (byte 0 is the type).
 * The **depth** channel streams ``[u32 LE length][32-byte header +
   tightly-packed float16 samples]`` frames.
+
+:class:`MockAudioPhone` is the RTSP server's audio track, byte-faithful to
+``RTSPConnection.swift`` / ``SDPBuilder.swift`` / ``RTPCore.swift`` / ``RTCP.swift``:
+the RTSP handshake (with Basic/Digest auth), then ``$``-framed interleaved RTP
+and compound RTCP Sender Reports.
 
 Stdlib only. Typical use::
 
@@ -16,10 +21,18 @@ Stdlib only. Typical use::
     phone.emit_imu(seq=1, gyro=(0.1, 0.2, 0.3))
     ...
     phone.close()
+
+    mic = MockAudioPhone(codec="L16", sample_rate=48000, channels=1).start()
+    audio = irtsp.audio_stream("127.0.0.1", port=mic.port, timeout=2.0)
+    mic.emit_l16([0, 1, 2, 3])
+    mic.end_stream()
+    mic.close()
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import math
 import socket
@@ -685,3 +698,497 @@ class MockPhone:
         # 30..31 pad
         self._depth.broadcast(length_prefixed(bytes(header) + bytes(samples)))
         return seq
+
+
+# --------------------------------------------------------------------------- #
+# RTSP audio track
+#
+# Byte-faithful to RTSPConnection.swift / SDPBuilder.swift / RTPCore.swift /
+# RTCP.swift: the RTSP handshake, `$`-framed interleaved RTP, and compound
+# SR+SDES Sender Reports.
+# --------------------------------------------------------------------------- #
+
+#: RTP payload type the app uses for audio, whatever the codec.
+AUDIO_PT = 97
+
+#: Seconds between the NTP epoch (1900) and the Unix epoch (1970).
+NTP_UNIX_DELTA = 2_208_988_800
+
+
+def interleaved(channel: int, packet: bytes) -> bytes:
+    """Frame a packet the way the RTSP server does: ``$``, channel, BE16 length."""
+    return b"$" + bytes([channel]) + struct.pack(">H", len(packet)) + packet
+
+
+def rtp_packet(
+    payload: bytes,
+    *,
+    seq: int,
+    timestamp: int,
+    ssrc: int,
+    marker: bool = False,
+    payload_type: int = AUDIO_PT,
+    csrcs: Sequence[int] = (),
+    extension: bytes | None = None,
+    padding: int = 0,
+) -> bytes:
+    """One RTP packet.
+
+    The app only ever emits the plain 12-byte header (V=2, no padding, no
+    extension, no CSRCs); ``csrcs``/``extension``/``padding`` exist so the
+    parser can be tested against the headers the RFC permits.
+    """
+    flags = 0x80 | (0x20 if padding else 0) | (0x10 if extension is not None else 0) | len(csrcs)
+    out = struct.pack(
+        ">BBHII", flags, (0x80 if marker else 0) | payload_type,
+        seq & 0xFFFF, timestamp & 0xFFFFFFFF, ssrc & 0xFFFFFFFF,
+    )
+    for csrc in csrcs:
+        out += struct.pack(">I", csrc & 0xFFFFFFFF)
+    if extension is not None:
+        assert len(extension) % 4 == 0, "an RTP extension is a whole number of words"
+        out += struct.pack(">HH", 0xBEDE, len(extension) // 4) + extension
+    out += payload
+    if padding:
+        out += b"\x00" * (padding - 1) + bytes([padding])
+    return out
+
+
+def sender_report(
+    *,
+    ssrc: int,
+    ntp_unix: float,
+    rtp_timestamp: int,
+    packet_count: int = 0,
+    octet_count: int = 0,
+    cname: str = "iRTSP@127.0.0.1",
+    with_sdes: bool = True,
+) -> bytes:
+    """A 28-byte SR, compound with an SDES behind it exactly like the app's."""
+    seconds = int(ntp_unix) + NTP_UNIX_DELTA
+    fraction = int((ntp_unix - int(ntp_unix)) * 2**32) & 0xFFFFFFFF
+    sr = struct.pack(
+        ">BBHIIIIII", 0x80, 200, 6, ssrc & 0xFFFFFFFF, seconds, fraction,
+        rtp_timestamp & 0xFFFFFFFF, packet_count, octet_count,
+    )
+    if not with_sdes:
+        return sr
+    items = bytes([1, len(cname)]) + cname.encode("utf-8") + b"\x00"
+    while (4 + len(items)) % 4:
+        items += b"\x00"
+    sdes = struct.pack(">BBHI", 0x81, 202, (8 + len(items)) // 4 - 1, ssrc & 0xFFFFFFFF)
+    return sr + sdes + items
+
+
+class MockAudioPhone:
+    """Mock of the iRTSP RTSP server's **audio** track on a 127.0.0.1 ephemeral port.
+
+    Serves OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN (with optional Basic or Digest
+    auth), then streams whatever the test emits. Timestamps and sequence numbers
+    advance themselves, so a test only names the *anomalies*::
+
+        mic.emit_l16([0] * 480)                       # contiguous
+        mic.emit_l16([0] * 480, gap_frames=960, marker=True)   # a capture gap
+        mic.emit_l16([0] * 480, lost=2)               # two packets never sent
+    """
+
+    def __init__(
+        self,
+        *,
+        codec: str = "l16",
+        sample_rate: int = 48000,
+        channels: int = 1,
+        path: str = "live",
+        auth: str | None = None,
+        username: str = "alice",
+        password: str = "s3cret",
+        realm: str = "iRTSP",
+        nonce: str = "bm9uY2UtZm9yLXRlc3Rz",
+        ssrc: int = 0x1A2B3C4D,
+        start_seq: int = 1000,
+        start_timestamp: int = 0,
+        fmtp: str | None = None,
+        video: bool = True,
+        session_id: str = "0BADCAFE",
+    ):
+        self.codec = codec.lower()
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.path = path
+        self.auth = auth  # None | "basic" | "digest"
+        self.username = username
+        self.password = password
+        self.realm = realm
+        self.nonce = nonce
+        self.ssrc = ssrc
+        self.video = video  # the SDP's video m-line, which the client must skip
+        self.session_id = session_id
+        self.fmtp = fmtp if fmtp is not None else self._default_fmtp()
+
+        #: Every request line the client sent, as ``(method, url)``.
+        self.requests: list[tuple[str, str]] = []
+        #: Every ``Authorization`` header seen (``None`` when it sent none).
+        self.authorizations: list[str | None] = []
+        self.challenges_sent = 0
+        self.played = threading.Event()
+        self.torn_down = threading.Event()
+
+        self._next_seq = start_seq & 0xFFFF
+        self._next_ts = start_timestamp & 0xFFFFFFFF
+        self._rtp_channel = 0
+        self._rtcp_channel = 1
+        self._listener: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._conn: socket.socket | None = None
+        self._send_lock = threading.Lock()
+        self._closed = False
+
+    # ------------------------------------------------------------- lifecycle
+
+    def start(self) -> "MockAudioPhone":
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        srv.settimeout(0.1)  # poll `_closed` so close() is always prompt
+        self._listener = srv
+        self._thread = threading.Thread(
+            target=self._accept_loop, name="mock-rtsp-accept", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    @property
+    def port(self) -> int:
+        assert self._listener is not None, "mock RTSP server not started"
+        return self._listener.getsockname()[1]
+
+    @property
+    def content_base(self) -> str:
+        """``Content-Base``, with the trailing slash the app sends."""
+        return f"rtsp://127.0.0.1:{self.port}/{self.path}/"
+
+    def end_stream(self) -> None:
+        """Stop sending (half-close), so the client sees a clean end of stream.
+
+        Everything already written is delivered first — the client's final,
+        partially-filled block still arrives.
+        """
+        conn = self._conn
+        if conn is not None:
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self._closed = True
+        if self._listener is not None:
+            try:
+                self._listener.close()
+            except OSError:
+                pass
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    # ------------------------------------------------------------------- RTSP
+
+    def _accept_loop(self) -> None:
+        assert self._listener is not None
+        while not self._closed:
+            try:
+                conn, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self._conn = conn
+            threading.Thread(
+                target=self._serve, args=(conn,), name="mock-rtsp-serve", daemon=True
+            ).start()
+
+    def _serve(self, conn: socket.socket) -> None:
+        reader = conn.makefile("rb")
+        while not self._closed:
+            try:
+                line = reader.readline()
+            except OSError:
+                return
+            if not line:
+                return
+            request = line.decode("utf-8", "replace").strip()
+            if not request:
+                continue
+            method, _, rest = request.partition(" ")
+            url = rest.split(" ")[0]
+            headers: dict[str, str] = {}
+            while True:
+                raw = reader.readline()
+                if not raw or raw in (b"\r\n", b"\n"):
+                    break
+                key, _, value = raw.decode("utf-8", "replace").partition(":")
+                headers[key.strip().lower()] = value.strip()
+            length = int(headers.get("content-length", 0) or 0)
+            if length:
+                reader.read(length)
+            self.requests.append((method, url))
+            self._handle(conn, method, url, headers)
+
+    def _handle(
+        self, conn: socket.socket, method: str, url: str, headers: dict[str, str]
+    ) -> None:
+        cseq = headers.get("cseq", "0")
+        session = [("Session", self.session_id)]
+        if method == "OPTIONS":  # the app never authenticates OPTIONS
+            self._respond(conn, 200, "OK", cseq, [
+                ("Public", "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, "
+                           "GET_PARAMETER, SET_PARAMETER"),
+            ])
+        elif method == "DESCRIBE":
+            if not self._authorized(method, url, headers):
+                return self._challenge(conn, cseq)
+            body = self.sdp().encode("utf-8")
+            self._respond(conn, 200, "OK", cseq, [
+                ("Content-Type", "application/sdp"),
+                ("Content-Base", self.content_base),
+            ], body)
+        elif method == "SETUP":
+            if not self._authorized(method, url, headers):
+                return self._challenge(conn, cseq)
+            transport = headers.get("transport", "")
+            assert "RTP/AVP/TCP" in transport, f"expected a TCP transport, got {transport!r}"
+            self._rtp_channel, self._rtcp_channel = _mock_interleaved(transport)
+            self._respond(conn, 200, "OK", cseq, [
+                ("Transport", f"RTP/AVP/TCP;unicast;interleaved="
+                              f"{self._rtp_channel}-{self._rtcp_channel};"
+                              f"ssrc={self.ssrc:08X}"),
+                ("Session", f"{self.session_id};timeout=60"),
+            ])
+        elif method == "PLAY":
+            if not self._authorized(method, url, headers):
+                return self._challenge(conn, cseq)
+            base = self.content_base.rstrip("/")
+            self._respond(conn, 200, "OK", cseq, session + [
+                ("Range", "npt=0.000-"),
+                ("RTP-Info", f"url={base}/trackID=1;seq={self._next_seq};"
+                             f"rtptime={self._next_ts}"),
+            ])
+            self.played.set()
+        elif method == "TEARDOWN":
+            self._respond(conn, 200, "OK", cseq, session)
+            self.torn_down.set()
+        elif method in ("PAUSE", "GET_PARAMETER", "SET_PARAMETER"):
+            self._respond(conn, 200, "OK", cseq, session)
+        else:
+            self._respond(conn, 405, "Method Not Allowed", cseq, [])
+
+    def _respond(
+        self,
+        conn: socket.socket,
+        status: int,
+        reason: str,
+        cseq: str,
+        extra: Sequence[tuple[str, str]],
+        body: bytes = b"",
+    ) -> None:
+        """``RTSPMessage.make``: status line, CSeq, Server, extras, Content-Length."""
+        lines = [f"RTSP/1.0 {status} {reason}", f"CSeq: {cseq}", "Server: iRTSP/1.0"]
+        lines += [f"{key}: {value}" for key, value in extra]
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+        head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+        try:
+            with self._send_lock:
+                conn.sendall(head + body)
+        except OSError:  # the client hung up (or we already half-closed)
+            pass
+
+    def _challenge(self, conn: socket.socket, cseq: str) -> None:
+        """The app's 401: Digest **and** Basic, one header line each."""
+        self.challenges_sent += 1
+        if self.auth == "digest":
+            extra = [
+                ("WWW-Authenticate",
+                 f'Digest realm="{self.realm}", nonce="{self.nonce}", algorithm=MD5'),
+                ("WWW-Authenticate", f'Basic realm="{self.realm}"'),
+            ]
+        else:
+            extra = [("WWW-Authenticate", f'Basic realm="{self.realm}"')]
+        self._respond(conn, 401, "Unauthorized", cseq, extra)
+
+    def _authorized(self, method: str, url: str, headers: dict[str, str]) -> bool:
+        header = headers.get("authorization")
+        self.authorizations.append(header)
+        if self.auth is None:
+            return True
+        if not header:
+            return False
+        scheme, _, rest = header.partition(" ")
+        scheme = scheme.lower()
+        if scheme == "basic":  # accepted in digest mode too, like DigestAuth.swift
+            expected = base64.b64encode(
+                f"{self.username}:{self.password}".encode("utf-8")
+            ).decode()
+            return rest.strip() == expected
+        if scheme == "digest" and self.auth == "digest":
+            params: dict[str, str] = {}
+            for chunk in rest.split(","):
+                key, sep, value = chunk.strip().partition("=")
+                if sep:
+                    params[key.strip().lower()] = value.strip().strip('"')
+            if params.get("realm") != self.realm or params.get("nonce") != self.nonce:
+                return False
+            if params.get("username") != self.username:
+                return False
+            ha1 = _md5(f"{self.username}:{self.realm}:{self.password}")
+            ha2 = _md5(f"{method}:{params.get('uri', '')}")
+            if params.get("qop") == "auth":
+                expected = _md5(f"{ha1}:{self.nonce}:{params.get('nc', '')}:"
+                                f"{params.get('cnonce', '')}:auth:{ha2}")
+            else:  # RFC 2069, which is what the app's challenge asks for
+                expected = _md5(f"{ha1}:{self.nonce}:{ha2}")
+            return params.get("response", "").lower() == expected
+        return False
+
+    # -------------------------------------------------------------------- SDP
+
+    def _rtpmap(self) -> str:
+        if self.codec == "aac":
+            return f"mpeg4-generic/{self.sample_rate}/{self.channels}"
+        if self.codec == "opus":
+            return "opus/48000/2"  # hardcoded by the app, whatever was captured
+        return f"L16/{self.sample_rate}/{self.channels}"
+
+    def _default_fmtp(self) -> str | None:
+        if self.codec == "aac":
+            return ("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizeLength=13;"
+                    "indexLength=3;indexDeltaLength=3;config=1190")
+        if self.codec == "opus":
+            return f"sprop-stereo={1 if self.channels > 1 else 0};useinbandfec=0"
+        return None
+
+    def sdp(self) -> str:
+        """The app's SDP: session block, the video track, then the audio track."""
+        lines = [
+            "v=0",
+            f"o=- {self.session_id} {self.session_id} IN IP4 127.0.0.1",
+            "s=iRTSP Live",
+            "i=iPhone camera",
+            "c=IN IP4 0.0.0.0",
+            "t=0 0",
+            "a=tool:iRTSP 1.0",
+            "a=type:broadcast",
+            "a=control:*",
+            "a=range:npt=0-",
+        ]
+        if self.video:
+            lines += [
+                "m=video 0 RTP/AVP 96",
+                "a=rtpmap:96 H264/90000",
+                "a=fmtp:96 packetization-mode=1;profile-level-id=640028",
+                "a=control:trackID=0",
+            ]
+        lines += [f"m=audio 0 RTP/AVP {AUDIO_PT}", f"a=rtpmap:{AUDIO_PT} {self._rtpmap()}"]
+        if self.fmtp:
+            lines.append(f"a=fmtp:{AUDIO_PT} {self.fmtp}")
+        lines.append("a=control:trackID=1")
+        return "\r\n".join(lines) + "\r\n"
+
+    # ------------------------------------------------------------------ media
+
+    def wait_for_play(self, timeout: float = 2.0) -> bool:
+        return self.played.wait(timeout)
+
+    def _write(self, channel: int, packet: bytes) -> None:
+        assert self.wait_for_play(), "no client has sent PLAY"
+        conn = self._conn
+        assert conn is not None
+        with self._send_lock:
+            conn.sendall(interleaved(channel, packet))
+
+    def emit_rtp(
+        self,
+        payload: bytes,
+        *,
+        frames: int,
+        marker: bool = False,
+        gap_frames: int = 0,
+        lost: int = 0,
+        seq: int | None = None,
+        timestamp: int | None = None,
+        payload_type: int = AUDIO_PT,
+        ssrc: int | None = None,
+        **packet_kwargs: Any,
+    ) -> tuple[int, int]:
+        """One RTP packet; returns its ``(seq, timestamp)``.
+
+        ``frames`` is how far the timestamp advances afterwards, ``gap_frames``
+        opens a hole in the timeline before this packet (a capture gap), and
+        ``lost`` skips that many sequence numbers — packets that were captured
+        and never sent, so the timestamp skips their audio too (``lost``
+        packets' worth of ``frames``).
+        """
+        if seq is None:
+            seq = (self._next_seq + lost) & 0xFFFF
+        if timestamp is None:
+            timestamp = (self._next_ts + gap_frames + lost * frames) & 0xFFFFFFFF
+        self._write(self._rtp_channel, rtp_packet(
+            payload, seq=seq, timestamp=timestamp, ssrc=self.ssrc if ssrc is None else ssrc,
+            marker=marker, payload_type=payload_type, **packet_kwargs,
+        ))
+        self._next_seq = (seq + 1) & 0xFFFF
+        self._next_ts = (timestamp + frames) & 0xFFFFFFFF
+        return seq, timestamp
+
+    def emit_l16(self, samples: Sequence[int], **kwargs: Any) -> tuple[int, int]:
+        """One L16 packet: interleaved int16 samples, **big-endian** on the wire."""
+        assert len(samples) % self.channels == 0, "need whole frames"
+        payload = struct.pack(f">{len(samples)}h", *samples)
+        return self.emit_rtp(payload, frames=len(samples) // self.channels, **kwargs)
+
+    def emit_sr(
+        self,
+        *,
+        ntp_unix: float,
+        rtp_timestamp: int | None = None,
+        packet_count: int = 0,
+        octet_count: int = 0,
+        with_sdes: bool = True,
+    ) -> None:
+        """One compound RTCP Sender Report on the RTCP channel."""
+        self._write(self._rtcp_channel, sender_report(
+            ssrc=self.ssrc,
+            ntp_unix=ntp_unix,
+            rtp_timestamp=self._next_ts if rtp_timestamp is None else rtp_timestamp,
+            packet_count=packet_count,
+            octet_count=octet_count,
+            with_sdes=with_sdes,
+        ))
+
+    def send_raw(self, data: bytes) -> None:
+        """Escape hatch: push arbitrary bytes down the RTSP connection."""
+        assert self.wait_for_play(), "no client has sent PLAY"
+        conn = self._conn
+        assert conn is not None
+        with self._send_lock:
+            conn.sendall(data)
+
+
+def _md5(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _mock_interleaved(transport: str) -> tuple[int, int]:
+    """The channels the client asked for — the app uses them verbatim."""
+    for part in transport.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key.strip().lower() == "interleaved" and value:
+            first, _, second = value.partition("-")
+            return int(first), int(second) if second else int(first) + 1
+    raise AssertionError(f"no interleaved= in Transport {transport!r}")

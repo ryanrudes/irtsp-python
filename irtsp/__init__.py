@@ -22,6 +22,15 @@ Pattern-match the whole odometry channel::
                 case irtsp.Pose(position=p):       ...
                 case irtsp.DepthFrame() as d:      ...
 
+Read the microphone as raw RTP, with the phone's capture gaps left visible
+instead of concealed (:mod:`irtsp.audio`)::
+
+    with irtsp.audio_stream(phone_ip) as audio:
+        for block in audio:
+            block.samples        # (n, channels) int16, contiguous — no hidden holes
+            block.rtp_timestamp  # RTP ticks of block.samples[0]
+            block.gap_frames     # frames of capture missing right before it
+
 Extras: ``irtsp[numpy]`` (depth arrays), ``irtsp[discovery]`` (Bonjour),
 ``irtsp[video]`` (frames + ``synced()`` bundles, experimental).
 
@@ -66,9 +75,10 @@ from .wire import ConnectionClosed, ProtocolError, RecordType
 
 if TYPE_CHECKING:  # pragma: no cover
     from .aio import AsyncRecordStream, AsyncSession
+    from .audio import AudioBlock, AudioStream, SenderReport
     from .discovery import Device
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 # Names resolved lazily (PEP 562) so `import irtsp` stays dependency-free and
 # fast, while `irtsp.Device` / `irtsp.AsyncSession` still work at runtime.
@@ -76,6 +86,10 @@ _LAZY = {
     "Device": ("irtsp.discovery", "Device"),
     "AsyncSession": ("irtsp.aio", "AsyncSession"),
     "AsyncRecordStream": ("irtsp.aio", "AsyncRecordStream"),
+    "audio_stream": ("irtsp.audio", "audio_stream"),
+    "AudioStream": ("irtsp.audio", "AudioStream"),
+    "AudioBlock": ("irtsp.audio", "AudioBlock"),
+    "SenderReport": ("irtsp.audio", "SenderReport"),
 }
 
 
@@ -102,6 +116,11 @@ __all__ = [
     "Device",
     "Handshake",
     "RecordStream",
+    # raw RTP audio
+    "audio_stream",
+    "AudioStream",
+    "AudioBlock",
+    "SenderReport",
     # records
     "Record",
     "IMU",
