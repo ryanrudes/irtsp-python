@@ -78,7 +78,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .audio import AudioBlock, AudioStream, SenderReport
     from .discovery import Device
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 # Names resolved lazily (PEP 562) so `import irtsp` stays dependency-free and
 # fast, while `irtsp.Device` / `irtsp.AsyncSession` still work at runtime.

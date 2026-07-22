@@ -374,20 +374,28 @@ def parse_sdp(sdp: str, base_url: str) -> _Media:
     ``a=control`` it carries. Session-level attributes — including the
     ``a=control:*`` above the first ``m=`` line — are deliberately not read as
     the audio track's.
+
+    Every ``m=audio`` section is collected before one is chosen, rather than a
+    single accumulator being reset on each new section. The reset version worked
+    only while audio was the *last* media section: an ``m=video`` after it threw
+    the captured audio away and the call failed with "no audio track", blaming
+    the app for having audio disabled. Section order is not something a client
+    may depend on, so it no longer decides the outcome.
     """
-    media: dict[str, str] | None = None
+    sections: list[tuple[str | None, str, str]] = []  # (rtpmap, fmtp, control)
+    in_audio = False
     rtpmap: str | None = None
     fmtp = ""
     control = ""
     for raw_line in sdp.splitlines():
         line = raw_line.strip()
         if line.startswith("m="):
-            in_audio = line[2:].startswith("audio")
-            media = {} if in_audio else None
             if in_audio:
-                rtpmap, fmtp, control = None, "", ""
+                sections.append((rtpmap, fmtp, control))
+            in_audio = line[2:].startswith("audio")
+            rtpmap, fmtp, control = None, "", ""
             continue
-        if media is None or not line.startswith("a="):
+        if not in_audio or not line.startswith("a="):
             continue
         attribute = line[2:]
         if attribute.startswith("rtpmap:") and rtpmap is None:
@@ -396,11 +404,19 @@ def parse_sdp(sdp: str, base_url: str) -> _Media:
             fmtp = attribute[len("fmtp:"):].strip()
         elif attribute.startswith("control:"):
             control = attribute[len("control:"):].strip()
-    if media is None or rtpmap is None:
+    if in_audio:
+        sections.append((rtpmap, fmtp, control))
+
+    # First audio section that carries an rtpmap. One without is unusable, so
+    # skipping past it beats failing on it when a usable section follows.
+    audio = next((section for section in sections if section[0] is not None), None)
+    if audio is None:
         raise ProtocolError(
             "the phone's SDP has no audio track with an rtpmap — is audio enabled "
             "in the iRTSP app?"
         )
+    rtpmap, fmtp, control = audio
+    assert rtpmap is not None
 
     payload_text, _, encoding_text = rtpmap.partition(" ")
     parts = encoding_text.split("/")

@@ -486,6 +486,40 @@ def test_parse_sdp_finds_the_audio_track_past_the_video_one(mic):
     assert media.control == base.rstrip("/") + "/trackID=1"
 
 
+def test_parse_sdp_finds_the_audio_track_before_the_video_one():
+    """Order must not decide the outcome.
+
+    The app happens to emit video first, so every real DESCRIBE exercised only
+    that order — and the parser passed for a reason that had nothing to do with
+    finding audio: audio was simply last. Reversed, it reported "no audio track"
+    and blamed the app for having audio disabled.
+    """
+    sdp = (
+        "v=0\r\n"
+        "m=audio 0 RTP/AVP 97\r\na=rtpmap:97 L16/48000/2\r\na=control:trackID=1\r\n"
+        "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:trackID=0\r\n"
+    )
+    media = parse_sdp(sdp, "rtsp://127.0.0.1:8554/live/")
+
+    assert media.codec == "l16"
+    assert media.sample_rate == 48000
+    assert media.channels == 2
+    # The video section's control must not leak into the audio track's.
+    assert media.control == "rtsp://127.0.0.1:8554/live/trackID=1"
+
+
+def test_parse_sdp_skips_an_audio_section_with_no_rtpmap():
+    sdp = (
+        "v=0\r\n"
+        "m=audio 0 RTP/AVP 97\r\na=control:trackID=1\r\n"
+        "m=audio 0 RTP/AVP 98\r\na=rtpmap:98 L16/48000/1\r\na=control:trackID=2\r\n"
+    )
+    media = parse_sdp(sdp, "rtsp://127.0.0.1:8554/live/")
+
+    assert media.payload_type == 98
+    assert media.control == "rtsp://127.0.0.1:8554/live/trackID=2"
+
+
 def test_parse_sdp_without_an_audio_track_says_so():
     sdp = "v=0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:trackID=0\r\n"
     with pytest.raises(ProtocolError, match="no audio track"):
