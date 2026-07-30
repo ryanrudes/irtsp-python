@@ -475,16 +475,29 @@ class MockPhone:
         width: int = 1920,
         height: int = 1080,
         snapshot: bool = False,
+        lens_position: float | None = None,
+        focus_mode: int | None = None,
+        adjusting_focus: bool | None = None,
     ) -> int:
         """Type 5: [fx, fy, ox] @24 then [oy, width, height] @36.
 
-        ``snapshot=True`` sets flags bit0 (v2 state-channel snapshot/keyframe).
+        ``snapshot=True`` sets flags bit0 — the pre-revision-3 state-channel
+        snapshot/keyframe marker. From revision 3 intrinsics are per-frame and this
+        is always clear.
+
+        The focus fields (revision 3, @48/@52/@53) default to the producer's
+        "unknown" sentinels — NaN and 0xFF — rather than to zeros, because zero is a
+        legal value for each of them.
         """
         seq = self._next_odo_seq(seq)
         host_ts, unix_ts = self._times(host_ts, unix_ts)
         buf = self._record(T_INTRINSICS, seq, host_ts, unix_ts)
         buf[1] = 0x01 if snapshot else 0x00
         struct.pack_into("<6f", buf, 24, fx, fy, cx, cy, float(width), float(height))
+        struct.pack_into("<f", buf, 48,
+                         float("nan") if lens_position is None else lens_position)
+        buf[52] = 0xFF if focus_mode is None else focus_mode
+        buf[53] = 0xFF if adjusting_focus is None else int(adjusting_focus)
         self._odo.broadcast(bytes(buf))
         return seq
 

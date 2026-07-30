@@ -41,6 +41,7 @@ from irtsp.records import (
     CameraFormat,
     CapturePath,
     DepthFrame,
+    FocusMode,
     Heading,
     Intrinsics,
     Pose,
@@ -214,8 +215,61 @@ def test_intrinsics_record_golden() -> None:
     assert rec.snapshot is False  # flags 0 = a real change event
 
 
-def test_intrinsics_snapshot_flag() -> None:
-    # flags bit0 (v2 state channels) = snapshot/keyframe, stamped at send time
+def test_intrinsics_focus_telemetry_needs_revision_3() -> None:
+    # The focus bytes are zero-filled by every producer before revision 3, and zero is a
+    # legal value for all three (FocusMode.LOCKED is 0). Without the revision they must
+    # read as "not reported", never as "locked at 0.0, not hunting".
+    buf = make_header(5)
+    struct.pack_into("<6f", buf, 24, 1000.5, 1001.25, 640.25, 360.125, 1280.0, 720.0)
+    struct.pack_into("<f", buf, 48, 0.0)
+    buf[52] = 0
+    buf[53] = 0
+    stale = decode_record(bytes(buf))
+    assert isinstance(stale, Intrinsics)
+    assert stale.lens_position is None
+    assert stale.focus_mode is None
+    assert stale.adjusting_focus is None
+
+    # Told the revision, the same bytes are a real report: locked at 0.0, settled.
+    fresh = decode_record(bytes(buf), revision=3)
+    assert isinstance(fresh, Intrinsics)
+    assert fresh.lens_position == 0.0
+    assert fresh.focus_mode is FocusMode.LOCKED
+    assert fresh.adjusting_focus is False
+
+
+def test_intrinsics_focus_telemetry_values_and_sentinels() -> None:
+    buf = make_header(5)
+    struct.pack_into("<6f", buf, 24, 1000.5, 1001.25, 640.25, 360.125, 1280.0, 720.0)
+    struct.pack_into("<f", buf, 48, 0.42)
+    buf[52] = 2  # continuousAutoFocus
+    buf[53] = 1  # hunting
+    rec = decode_record(bytes(buf), revision=3)
+    assert isinstance(rec, Intrinsics)
+    assert rec.lens_position == pytest.approx(0.42)
+    assert rec.focus_mode is FocusMode.CONTINUOUS_AUTO_FOCUS
+    assert rec.adjusting_focus is True
+    # …and survives a rescale, which only touches the projection
+    assert rec.scaled(640, 360).focus_mode is FocusMode.CONTINUOUS_AUTO_FOCUS
+
+    # The ARKit path has no focus signal at all and says so with the sentinels.
+    struct.pack_into("<f", buf, 48, float("nan"))
+    buf[52] = 0xFF
+    buf[53] = 0xFF
+    ar = decode_record(bytes(buf), revision=3)
+    assert isinstance(ar, Intrinsics)
+    assert ar.lens_position is None
+    assert ar.focus_mode is None
+    assert ar.adjusting_focus is None
+
+    # An unknown focus mode from a newer producer degrades to None, never raises.
+    buf[52] = 7
+    assert decode_record(bytes(buf), revision=3).focus_mode is None
+
+
+def test_intrinsics_snapshot_flag_pre_revision_3() -> None:
+    # flags bit0 = snapshot/keyframe under the pre-revision-3 state-channel semantics,
+    # stamped at send time. Still decoded, because the Android producer still sends it.
     buf = make_header(5, flags=0x01)
     struct.pack_into("<6f", buf, 24, 1000.5, 1001.25, 640.25, 360.125, 1280.0, 720.0)
     rec = decode_record(bytes(buf))

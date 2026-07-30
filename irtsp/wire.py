@@ -34,6 +34,7 @@ from .records import (
     CameraFormat,
     CapturePath,
     DepthFrame,
+    FocusMode,
     GNSS,
     Heading,
     IMU,
@@ -167,11 +168,20 @@ def _enum_or(enum_cls: type, value: int, fallback: Any) -> Any:
         return fallback
 
 
-def decode_record(buf: bytes | bytearray | memoryview) -> Record:
+def decode_record(buf: bytes | bytearray | memoryview, *, revision: int | None = None) -> Record:
     """Decode one 64-byte odometry record into its typed :class:`~irtsp.Record`.
 
     Unknown types come back as :class:`~irtsp.Unknown` rather than raising, so
     old clients keep working when new record types appear.
+
+    ``revision`` is the handshake's ``revision`` for the connection these bytes came
+    from, and gates fields that only exist from a given revision onward. It matters
+    for exactly one thing today: the focus telemetry in the intrinsics record lives
+    in bytes a pre-revision-3 producer leaves **zero-filled**, and zero is a legal
+    value for all three (``FocusMode.LOCKED`` is 0). Without the revision those
+    zeros would decode as "lens locked at 0.0, not hunting" — a claim the producer
+    never made. Omitted (the default) means "unknown", and those fields read
+    ``None``; :class:`~irtsp.Session` passes the real value through.
     """
     if len(buf) < RECORD_SIZE:
         raise ProtocolError(f"record needs {RECORD_SIZE} bytes, got {len(buf)}")
@@ -204,9 +214,27 @@ def decode_record(buf: bytes | bytearray | memoryview) -> Record:
 
     if type_id == RecordType.INTRINSICS:
         fx, fy, cx, cy, width, height = struct.unpack_from("<6f", buf, 24)
+        # Focus telemetry (revision 3) at @48/@52/@53, and only there: before it these
+        # bytes were never written, so they are zeros — and zero is a legal value for
+        # all three (FocusMode.LOCKED is raw 0). Reading them without knowing the
+        # revision would turn "the producer said nothing" into "locked at 0.0, not
+        # hunting". Within revision 3 the producer's own sentinels apply: NaN / 0xFF
+        # for the ARKit path, which has no focus signal to report.
+        lens_position: float | None = None
+        focus_mode: FocusMode | None = None
+        adjusting_focus: bool | None = None
+        if revision is not None and revision >= 3:
+            (raw_lens,) = struct.unpack_from("<f", buf, 48)
+            lens_position = None if math.isnan(raw_lens) else raw_lens
+            focus_mode = (None if buf[52] == 0xFF else _enum_or(FocusMode, buf[52], None))
+            adjusting_focus = None if buf[53] == 0xFF else bool(buf[53])
         return Intrinsics(
             fx=fx, fy=fy, cx=cx, cy=cy, width=int(width), height=int(height),
-            # flags bit0 (v2 state channels): snapshot/keyframe, stamped at send time
+            lens_position=lens_position,
+            focus_mode=focus_mode,
+            adjusting_focus=adjusting_focus,
+            # flags bit0: snapshot/keyframe under the pre-revision-3 state-channel
+            # semantics. Always 0 from a per-frame producer.
             snapshot=bool(buf[1] & 0x01),
             **common,
         )

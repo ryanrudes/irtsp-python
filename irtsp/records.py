@@ -54,6 +54,7 @@ __all__ = [
     "DepthFrame",
     "Camera",
     "CapturePath",
+    "FocusMode",
     "ReadoutDirection",
     "PTSConvention",
     "PTSProvenance",
@@ -280,6 +281,20 @@ class PTSProvenance(IntEnum):
     MEASURED = 2
 
 
+class FocusMode(IntEnum):
+    """What the lens was being driven by, as last reported (``AVCaptureDevice.FocusMode``).
+
+    Sampled asynchronously from the frame it rides on, so it is the *last reported*
+    lens state, not the state at exactly that PTS. Unknown on the ARKit capture path,
+    where it decodes to ``None`` rather than to a member — a zero here would read as
+    :attr:`LOCKED`, which is a claim ARKit never makes.
+    """
+
+    LOCKED = 0
+    AUTO_FOCUS = 1
+    CONTINUOUS_AUTO_FOCUS = 2
+
+
 class ReadoutProvenance(IntEnum):
     """Whether a full-frame readout time is available for this format.
 
@@ -350,11 +365,20 @@ class RawAccel(Record):
 class Intrinsics(Record):
     """Pinhole camera intrinsics (wire type 5), in pixels at (``width`` × ``height``).
 
-    A **state channel** (protocol v2): sent when the projection changes
-    (zoom/lens switch), plus a snapshot on connect and a keyframe every ~10 s
-    re-asserting the current value — so :meth:`irtsp.Session.latest` almost
-    always has one, and silence means "unchanged", never "absent".
-    No lens-distortion model — the video is rectilinear.
+    A **continuous per-frame channel** from protocol revision 3: one record per
+    video frame, and ``host_ts`` **is that frame's presentation timestamp** — so a
+    record joins to a frame by equality, not by holding a value over an interval.
+    Intrinsics move every frame (optical stabilisation slides the principal point;
+    focus changes the focal length), which is what makes them continuous rather
+    than state. No lens-distortion model — the video is rectilinear.
+
+    Before revision 3 this was a state channel: emitted only past a change
+    threshold, with snapshots and keyframes, and stamped at send time rather than
+    with the frame's own PTS. Both shapes decode here — :attr:`snapshot` is still
+    populated from flags bit0 — so a producer still on the old semantics (the
+    Android app, as of this release) is read correctly; check
+    :attr:`irtsp.Session.handshake` ``["revision"]`` if you need to know which you
+    are getting.
     """
 
     __match_args__: ClassVar[tuple[str, ...]] = ("fx", "fy", "cx", "cy")
@@ -365,10 +389,19 @@ class Intrinsics(Record):
     cy: float  #: principal point y, px
     width: int  #: resolution the intrinsics are expressed at
     height: int
-    #: True for a snapshot/keyframe (wire flags bit0, protocol v2): the current
-    #: state re-asserted, stamped at send time. False for a real change event,
-    #: which carries the sensor's own timestamp. If you only care about the
-    #: value, ignore it. (Always False from v1 servers and older apps.)
+    #: Lens position 0…1 as last reported, or ``None`` when unknown (every ARKit
+    #: record, and every producer before revision 3). Not a distance — it is the
+    #: driver's own scale, comparable only against itself.
+    lens_position: float | None = None
+    #: What was driving the lens, as last reported; ``None`` when unknown.
+    focus_mode: FocusMode | None = None
+    #: Whether the lens was hunting, as last reported; ``None`` when unknown. This
+    #: is the field that makes a focal-length change *attributable* to a refocus
+    #: instead of inferred from how far ``fx`` moved.
+    adjusting_focus: bool | None = None
+    #: True for a snapshot/keyframe (wire flags bit0). **Always False from
+    #: revision 3 onward** — a per-frame channel has nothing to re-assert. Only
+    #: meaningful from a producer still on the old state-channel semantics.
     snapshot: bool = False
 
     @property
@@ -387,6 +420,8 @@ class Intrinsics(Record):
             host_ts=self.host_ts, unix_ts=self.unix_ts, seq=self.seq, gap=self.gap,
             fx=self.fx * sx, fy=self.fy * sy, cx=self.cx * sx, cy=self.cy * sy,
             width=width, height=height, snapshot=self.snapshot,
+            lens_position=self.lens_position, focus_mode=self.focus_mode,
+            adjusting_focus=self.adjusting_focus,
         )
 
 

@@ -398,7 +398,8 @@ class Session:
         try:
             while not self._closed.is_set():
                 try:
-                    record = decode_record(read_exact(sock, RECORD_SIZE))
+                    revision = self.info.revision if self.info else None
+                    record = decode_record(read_exact(sock, RECORD_SIZE), revision=revision)
                 except (OSError, ConnectionClosed, ProtocolError) as e:
                     if isinstance(e, ProtocolError):
                         log.error("odometry stream desynced: %s", e)
@@ -407,10 +408,18 @@ class Session:
                         return
                     sock, last_seq = sock2, None
                     continue
-                # Late joiners: the server replays the latest Intrinsics, SyncModel and
-                # CameraFormat records with their ORIGINAL (stale) seq — don't let any of
-                # them baseline the gap tracker or the first live record shows a huge bogus gap.
-                if last_seq is None and isinstance(record, (Intrinsics, SyncModel, CameraFormat)):
+                # Late joiners: the server replays the latest SyncModel and CameraFormat
+                # records with their ORIGINAL (stale) seq — don't let either baseline the
+                # gap tracker or the first live record shows a huge bogus gap.
+                #
+                # Intrinsics is no longer unconditionally in that list. From revision 3 it is
+                # a continuous per-frame channel with nothing replayed, so its first record is
+                # an ordinary live one and skipping it would throw away a real baseline. A
+                # pre-revision-3 producer (the Android app today) does still replay one — and
+                # says so on the wire, in the flag that marks a re-asserted value. Branching on
+                # the flag rather than on the revision is exact for both.
+                if last_seq is None and (isinstance(record, (SyncModel, CameraFormat))
+                                         or (isinstance(record, Intrinsics) and record.snapshot)):
                     self._dispatch(record)
                     continue
                 last_seq = self._track_gap(record, last_seq)
@@ -577,10 +586,16 @@ class Session:
 
         Lookup is by concrete class (``latest(irtsp.IMU)``), not by base class —
         ``latest(irtsp.Record)`` is always ``None``. With ``wait``, blocks up to
-        that many seconds for one to arrive — handy for
-        :class:`~irtsp.Intrinsics`, which the server replays on connect::
+        that many seconds for one to arrive — handy for :class:`~irtsp.Intrinsics`,
+        which arrives once per video frame, so the wait is at most a frame::
 
             k = phone.latest(irtsp.Intrinsics, wait=2.0)
+
+        Note what "latest" means for a per-frame channel: the matrix for the most
+        recent *frame*, which is not necessarily the frame you are holding. To pair
+        a matrix with a specific frame, match ``host_ts`` — it **is** that frame's
+        presentation timestamp, so the join is by equality (see
+        :class:`~irtsp.VideoBundle`).
         """
         deadline = None if wait is None else time.monotonic() + wait
         with self._lock:

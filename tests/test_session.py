@@ -381,6 +381,34 @@ def test_handshake_v2_accepted_and_exposed(request):
         assert rec.seq == 1
 
 
+def test_per_frame_intrinsics_baselines_the_gap_tracker(phone, session):
+    """A revision-3 intrinsics record is ordinary live traffic and must baseline seq.
+
+    It used to be exempted along with the replayed state channels, which was right when
+    the server opened every connection with a stale-seq intrinsics snapshot. Per-frame
+    intrinsics replay nothing, so exempting the first one would throw away the baseline
+    and hide a real drop right at the start of the session.
+    """
+    stream = session.stream(irtsp.Intrinsics)
+    phone.emit_intrinsics(seq=10)           # per-frame: flags 0, live seq
+    phone.emit_intrinsics(seq=13)           # two records lost in between
+    first, second = collect(stream, 2)
+    assert first.gap == 0                   # nothing to compare the first against
+    assert second.gap == 2
+
+
+def test_replayed_intrinsics_snapshot_still_skips_the_baseline(phone, session):
+    """The pre-revision-3 producer replays one with a stale seq, and flags it as such."""
+    stream = session.stream(irtsp.Intrinsics)
+    phone.emit_intrinsics(seq=900, snapshot=True)   # connect replay, seq is stale
+    phone.emit_intrinsics(seq=13)
+    phone.emit_intrinsics(seq=14)
+    replay, live, next_live = collect(stream, 3)
+    assert replay.snapshot is True
+    assert live.gap == 0        # the stale seq never became a baseline
+    assert next_live.gap == 0
+
+
 def test_snapshot_flag_surfaces_on_state_channels(phone, session):
     stream = session.stream(irtsp.Intrinsics, irtsp.Heading)
     phone.emit_intrinsics(seq=1, snapshot=True)   # connect-snapshot / keyframe

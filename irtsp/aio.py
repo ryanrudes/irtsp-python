@@ -196,10 +196,14 @@ class AsyncSession:
         try:
             while True:
                 buf = await reader.readexactly(RECORD_SIZE)
-                record = decode_record(buf)
-                # Server replays the latest Intrinsics, SyncModel and CameraFormat
-                # (stale seq) to late joiners — don't let any baseline the gap tracker.
-                if last_seq is None and isinstance(record, (Intrinsics, SyncModel, CameraFormat)):
+                record = decode_record(buf, revision=self.info.revision if self.info else None)
+                # Server replays the latest SyncModel and CameraFormat (stale seq) to late
+                # joiners — don't let either baseline the gap tracker. Intrinsics is only
+                # replayed by a pre-revision-3 producer, which flags it as a re-asserted
+                # value; from revision 3 it is a per-frame channel whose first record is an
+                # ordinary live one and must baseline normally. See `Session._record_loop`.
+                if last_seq is None and (isinstance(record, (SyncModel, CameraFormat))
+                                         or (isinstance(record, Intrinsics) and record.snapshot)):
                     self._dispatch(record, None)
                     continue
                 last_seq = self._dispatch(record, last_seq)

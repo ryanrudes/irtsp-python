@@ -70,7 +70,7 @@ iterator** with its own buffer — create as many as you like, they don't compet
 |---|---|---|---|---|
 | `IMU` | `phone.imu` | ≤ ~100 Hz | `gyro` rad/s · `accel` m/s² (gravity **included**; face-up at rest ≈ (0, 0, −9.81)) · `quat` (x, y, z, w), body→world | `accel_g` |
 | `RawGyro` / `RawAccel` | `phone.raw_gyro` / `phone.raw_accel` | raw sensor mode | rad/s · m/s² | `accel_g` |
-| `Intrinsics` | `phone.intrinsics` | on zoom/lens change, + 10 s keyframes (v2) | `fx fy cx cy` px at `width×height` · `matrix` (3×3 K) · `scaled()` · `snapshot` | — |
+| `Intrinsics` | `phone.intrinsics` | one per video frame (rev 3) | `fx fy cx cy` px at `width×height` · `matrix` (3×3 K) · `scaled()` · `lens_position` · `focus_mode` · `adjusting_focus` | — |
 | `GNSS` | `phone.gnss` | ~1 Hz | `lat`/`lon` deg · `altitude` m · `speed` m/s · `h_accuracy`/`v_accuracy` m · `course_deg` | `course_rad` |
 | `Altitude` | `phone.altitude` | ~1 Hz | `relative_altitude` m · `pressure` **Pa** | `pressure_kpa`, `pressure_hpa` |
 | `Heading` | `phone.heading` | on-change, capped ~1 Hz, + 10 s keyframes (v2) | `true_deg` · `magnetic_deg` · `accuracy_deg` · `snapshot` | `true_rad`, `magnetic_rad` |
@@ -174,8 +174,16 @@ phone.run()   # blocks until the session closes; Ctrl-C exits cleanly
 
 Callbacks run on the reader thread, so keep them quick; a callback that raises is
 logged and never kills the reader. `phone.latest(irtsp.Intrinsics, wait=2.0)` gives
-you the most recent record of a type — handy for intrinsics, which the server replays
-to late joiners on connect.
+you the most recent record of a type — handy for intrinsics, which arrive once per
+video frame, so the wait is at most a frame.
+
+Intrinsics are a **per-frame** channel from protocol revision 3: `host_ts` *is* that
+frame's presentation timestamp, so a matrix pairs with a frame by equality rather than
+by holding a value over an interval. Each record also carries the focus state the lens
+was last reported in (`lens_position`, `focus_mode`, `adjusting_focus`), which is what
+makes a focal-length change attributable to a refocus instead of guessed at from how
+far `fx` moved. All three read `None` on the ARKit capture path, which has no focus
+signal to report, and from any producer older than revision 3.
 
 ## asyncio
 
@@ -199,7 +207,7 @@ asyncio.run(main())
 import irtsp                       # pip install "irtsp[numpy]"
 
 with irtsp.connect("192.168.1.24", depth=True) as phone:
-    K = phone.latest(irtsp.Intrinsics, wait=2.0)      # replayed on connect
+    K = phone.latest(irtsp.Intrinsics, wait=2.0)      # one per video frame
 
     for frame in phone.depth:
         depth = frame.meters                          # (H, W) float32, meters

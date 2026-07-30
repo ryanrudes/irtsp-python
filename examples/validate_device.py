@@ -9,7 +9,7 @@ the phone. Start streaming in the iRTSP app, then::
 Checks, per enabled stream: records decode, rates look sane (measured from
 host_ts deltas, never the requested rate), timestamps are monotonic and the
 clock anchor maps host→unix consistently, quaternions are unit-norm, sentinel
-fields are None-or-plausible, intrinsics arrive (replayed on connect), and no
+fields are None-or-plausible, intrinsics arrive (one per video frame), and no
 unexplained gaps. Exits 0 if everything passes.
 """
 
@@ -50,7 +50,7 @@ def main() -> int:
 
         intr = phone.latest(irtsp.Intrinsics, wait=3.0)
         if info.streams.get("intrinsics", False):
-            (ok if intr else bad)("intrinsics replayed on connect")
+            (ok if intr else bad)("intrinsics arriving (one per video frame)")
             if intr:
                 print(f"    fx={intr.fx:.1f} fy={intr.fy:.1f} @ {intr.width}x{intr.height}")
 

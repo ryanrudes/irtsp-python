@@ -52,7 +52,7 @@ def main() -> None:
         with irtsp.connect(args.host, depth=True) as phone:
             print("waiting for a depth frame (is the app in LiDAR depth mode?) ...")
             frame = next(phone.depth)
-            k = phone.latest(irtsp.Intrinsics, wait=2.0)  # replayed on connect
+            k = phone.latest(irtsp.Intrinsics, wait=2.0)  # one per video frame
     except StopIteration:
         sys.exit("connection closed before a depth frame arrived")
     except KeyboardInterrupt:
