@@ -70,7 +70,7 @@ iterator** with its own buffer — create as many as you like, they don't compet
 |---|---|---|---|---|
 | `IMU` | `phone.imu` | ≤ ~100 Hz | `gyro` rad/s · `accel` m/s² (gravity **included**; face-up at rest ≈ (0, 0, −9.81)) · `quat` (x, y, z, w), body→world | `accel_g` |
 | `RawGyro` / `RawAccel` | `phone.raw_gyro` / `phone.raw_accel` | raw sensor mode | rad/s · m/s² | `accel_g` |
-| `Intrinsics` | `phone.intrinsics` | one per video frame (rev 3) | `fx fy cx cy` px at `width×height` · `matrix` (3×3 K) · `scaled()` · `lens_position` · `focus_mode` · `adjusting_focus` | — |
+| `Intrinsics` | `phone.intrinsics` | one per video frame (rev 3) | `fx fy cx cy` px at `width×height` · `matrix` (3×3 K) · `scaled()` · `lens_position` · `focus_mode` · `adjusting_focus` · `*_age` (rev 4) | — |
 | `GNSS` | `phone.gnss` | ~1 Hz | `lat`/`lon` deg · `altitude` m · `speed` m/s · `h_accuracy`/`v_accuracy` m · `course_deg` | `course_rad` |
 | `Altitude` | `phone.altitude` | ~1 Hz | `relative_altitude` m · `pressure` **Pa** | `pressure_kpa`, `pressure_hpa` |
 | `Heading` | `phone.heading` | on-change, capped ~1 Hz, + 10 s keyframes (v2) | `true_deg` · `magnetic_deg` · `accuracy_deg` · `snapshot` | `true_rad`, `magnetic_rad` |
@@ -184,6 +184,15 @@ was last reported in (`lens_position`, `focus_mode`, `adjusting_focus`), which i
 makes a focal-length change attributable to a refocus instead of guessed at from how
 far `fx` moved. All three read `None` on the ARKit capture path, which has no focus
 signal to report, and from any producer older than revision 3.
+
+Those three are joined to the frame differently from the rest of the record, and it is
+worth knowing which is which. `fx`/`fy`/`cx`/`cy` come from an attachment on the frame's
+own sample buffer — same object, same instant. The focus fields are device properties
+sampled asynchronously, so they are the last reported value, joined by recency. From
+revision 4 each carries its own age (`lens_age`, `focus_mode_age`, `adjusting_age`, in
+seconds relative to the frame; negative means the reading arrived after it), so you can
+drop rows whose focus state is too stale to mean anything. Three ages rather than one
+because the three properties are reported independently of each other.
 
 ## asyncio
 

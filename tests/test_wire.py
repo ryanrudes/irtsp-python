@@ -267,6 +267,27 @@ def test_intrinsics_focus_telemetry_values_and_sentinels() -> None:
     assert decode_record(bytes(buf), revision=3).focus_mode is None
 
 
+def test_intrinsics_focus_ages_revision_4() -> None:
+    buf = make_header(5)
+    struct.pack_into("<6f", buf, 24, 1000.5, 1001.25, 640.25, 360.125, 1280.0, 720.0)
+    struct.pack_into("<f", buf, 48, 0.42)
+    buf[52], buf[53] = 2, 1
+    # 12 ms stale, mode never reported, and an adjusting flag that POST-dates the frame.
+    struct.pack_into("<3h", buf, 54, 12, -32768, -5)
+    rec = decode_record(bytes(buf), revision=4)
+    assert isinstance(rec, Intrinsics)
+    assert rec.lens_age == pytest.approx(0.012)
+    assert rec.focus_mode_age is None          # never reported
+    assert rec.adjusting_age == pytest.approx(-0.005)
+    assert rec.scaled(640, 360).lens_age == pytest.approx(0.012)
+
+    # A revision-3 producer leaves those bytes reserved, so they must not be read as ages.
+    older = decode_record(bytes(buf), revision=3)
+    assert isinstance(older, Intrinsics)
+    assert (older.lens_age, older.focus_mode_age, older.adjusting_age) == (None, None, None)
+    assert older.lens_position == pytest.approx(0.42)   # revision-3 fields still decode
+
+
 def test_intrinsics_snapshot_flag_pre_revision_3() -> None:
     # flags bit0 = snapshot/keyframe under the pre-revision-3 state-channel semantics,
     # stamped at send time. Still decoded, because the Android producer still sends it.

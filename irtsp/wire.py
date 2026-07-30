@@ -223,6 +223,17 @@ def decode_record(buf: bytes | bytearray | memoryview, *, revision: int | None =
         lens_position: float | None = None
         focus_mode: FocusMode | None = None
         adjusting_focus: bool | None = None
+        lens_age: float | None = None
+        focus_mode_age: float | None = None
+        adjusting_age: float | None = None
+        if revision is not None and revision >= 4:
+            # Signed milliseconds from each property's report to THIS frame's timestamp;
+            # INT16_MIN means the property was never reported. Negative is normal — a
+            # reading can post-date the frame it rides with.
+            raw_ages = struct.unpack_from("<3h", buf, 54)
+            lens_age, focus_mode_age, adjusting_age = (
+                None if a == -32768 else a / 1000.0 for a in raw_ages
+            )
         if revision is not None and revision >= 3:
             (raw_lens,) = struct.unpack_from("<f", buf, 48)
             lens_position = None if math.isnan(raw_lens) else raw_lens
@@ -233,6 +244,9 @@ def decode_record(buf: bytes | bytearray | memoryview, *, revision: int | None =
             lens_position=lens_position,
             focus_mode=focus_mode,
             adjusting_focus=adjusting_focus,
+            lens_age=lens_age,
+            focus_mode_age=focus_mode_age,
+            adjusting_age=adjusting_age,
             # flags bit0: snapshot/keyframe under the pre-revision-3 state-channel
             # semantics. Always 0 from a per-frame producer.
             snapshot=bool(buf[1] & 0x01),

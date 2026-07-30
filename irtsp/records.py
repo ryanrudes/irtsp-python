@@ -372,6 +372,13 @@ class Intrinsics(Record):
     focus changes the focal length), which is what makes them continuous rather
     than state. No lens-distortion model — the video is rectilinear.
 
+    The projection fields (``fx``/``fy``/``cx``/``cy``) come from an attachment on the
+    frame's own sample buffer — same object, same instant, exact. The three focus fields
+    do **not**: they are device properties sampled asynchronously, so they are joined to
+    the frame by recency. From revision 4 each carries its own age (:attr:`lens_age`,
+    :attr:`focus_mode_age`, :attr:`adjusting_age`) so you can tell how loose that join
+    was; three separate ages because the three properties are reported independently.
+
     Before revision 3 this was a state channel: emitted only past a change
     threshold, with snapshots and keyframes, and stamped at send time rather than
     with the frame's own PTS. Both shapes decode here — :attr:`snapshot` is still
@@ -399,6 +406,14 @@ class Intrinsics(Record):
     #: is the field that makes a focal-length change *attributable* to a refocus
     #: instead of inferred from how far ``fx`` moved.
     adjusting_focus: bool | None = None
+    #: How stale :attr:`lens_position` was, in **seconds relative to this frame's
+    #: timestamp** — negative means the reading arrived *after* the frame it rides
+    #: with, which is normal. ``None`` when never reported, or before revision 4.
+    lens_age: float | None = None
+    #: Same, for :attr:`focus_mode`.
+    focus_mode_age: float | None = None
+    #: Same, for :attr:`adjusting_focus`.
+    adjusting_age: float | None = None
     #: True for a snapshot/keyframe (wire flags bit0). **Always False from
     #: revision 3 onward** — a per-frame channel has nothing to re-assert. Only
     #: meaningful from a producer still on the old state-channel semantics.
@@ -421,7 +436,8 @@ class Intrinsics(Record):
             fx=self.fx * sx, fy=self.fy * sy, cx=self.cx * sx, cy=self.cy * sy,
             width=width, height=height, snapshot=self.snapshot,
             lens_position=self.lens_position, focus_mode=self.focus_mode,
-            adjusting_focus=self.adjusting_focus,
+            adjusting_focus=self.adjusting_focus, lens_age=self.lens_age,
+            focus_mode_age=self.focus_mode_age, adjusting_age=self.adjusting_age,
         )
 
 
