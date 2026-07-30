@@ -227,9 +227,11 @@ def decode_record(buf: bytes | bytearray | memoryview, *, revision: int | None =
         focus_mode_age: float | None = None
         adjusting_age: float | None = None
         if revision is not None and revision >= 4:
-            # Signed milliseconds from each property's report to THIS frame's timestamp;
-            # INT16_MIN means the property was never reported. Negative is normal — a
-            # reading can post-date the frame it rides with.
+            # Milliseconds from each property's report to THIS frame's exposure;
+            # INT16_MIN means there was no reading at or before it. A conforming
+            # revision-4 producer emits >= 0 (it never uses a report newer than the
+            # frame), but the field stays signed and is decoded as-is rather than
+            # clamped — a negative value would be a producer bug worth seeing.
             raw_ages = struct.unpack_from("<3h", buf, 54)
             lens_age, focus_mode_age, adjusting_age = (
                 None if a == -32768 else a / 1000.0 for a in raw_ages

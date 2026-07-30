@@ -190,8 +190,10 @@ worth knowing which is which. `fx`/`fy`/`cx`/`cy` come from an attachment on the
 own sample buffer — same object, same instant. The focus fields are device properties
 sampled asynchronously, so they are the last reported value, joined by recency. From
 revision 4 each carries its own age (`lens_age`, `focus_mode_age`, `adjusting_age`, in
-seconds relative to the frame; negative means the reading arrived after it), so you can
-drop rows whose focus state is too stale to mean anything. Three ages rather than one
+seconds before the frame's exposure, always `>= 0`), so you can drop rows whose focus
+state is too stale to mean anything. The producer uses the newest report at or before
+the exposure, never a later one — so a lens state is never attributed to a frame that
+was exposed before it existed. Three ages rather than one
 because the three properties are reported independently of each other.
 
 ## asyncio

@@ -406,9 +406,11 @@ class Intrinsics(Record):
     #: is the field that makes a focal-length change *attributable* to a refocus
     #: instead of inferred from how far ``fx`` moved.
     adjusting_focus: bool | None = None
-    #: How stale :attr:`lens_position` was, in **seconds relative to this frame's
-    #: timestamp** — negative means the reading arrived *after* the frame it rides
-    #: with, which is normal. ``None`` when never reported, or before revision 4.
+    #: How stale :attr:`lens_position` was, in **seconds before this frame's
+    #: exposure**. Always ``>= 0``: the producer uses the newest report at or before
+    #: the exposure, never a later one, so a lens state is never attributed to a frame
+    #: exposed before it existed. ``None`` when there was no reading at or before this
+    #: frame, or before revision 4.
     lens_age: float | None = None
     #: Same, for :attr:`focus_mode`.
     focus_mode_age: float | None = None
