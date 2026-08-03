@@ -257,8 +257,11 @@ class ReadoutDirection(IntEnum):
 class PTSConvention(IntEnum):
     """What instant a frame's PTS denotes, relative to the readout window.
 
-    The anchor for the row-time model ``t(row) = t_frame + Δt + α(row)·t_r``.
+    The anchor for the row-time model ``t(row) = t_anchor + α(row)·t_r``.
     An unrecognized wire value decodes to :attr:`UNKNOWN`.
+
+    iRTSP ships :attr:`READOUT_INSTANT`, which deliberately claims less than the
+    other four — see its own docs for what you must do differently.
     """
 
     UNKNOWN = 0
@@ -267,13 +270,41 @@ class PTSConvention(IntEnum):
     LAST_ROW_END = 3
     EXPOSURE_START = 4
 
+    READOUT_INSTANT = 5
+    """``host_ts`` marks a *read* instant — an exposure **end** — of one fixed but
+    unidentifiable row, plus a constant per-format latency ``D``:
+
+    .. code-block:: text
+
+        t_anchor          = host_ts - exposure - D      # row 0 starts integrating
+        exposure_start(n) = t_anchor + (n / (rows - 1)) * readout_time_s
+        exposure_mid(n)   = exposure_start(n) + exposure / 2
+
+    Two things follow that the other conventions do not imply:
+
+    * **The anchor moves one-for-one with exposure time.** Subtract *this frame's*
+      :attr:`~irtsp.records.CameraIntrinsicsRecord.exposure_us`, not a per-format
+      constant — under auto-exposure the shutter moves every frame, and a fixed
+      offset is wrong by however far it moved.
+    * **``D`` is one unknown, not two.** Which row is being read is not recoverable
+      even in principle: ``k · readout_time_s(format)`` and a per-format constant
+      offset are the same function of format. Any camera↔clock offset calibration
+      absorbs ``D`` whole, and it cancels exactly in row-to-row and frame-to-frame
+      differences — so relative row timing needs no calibration at all.
+    """
+
 
 class PTSProvenance(IntEnum):
     """How the :class:`PTSConvention` was established.
 
-    :attr:`DOCUMENTED` is a declared default from Apple's docs / the pipeline —
-    **not** an on-device measurement; :attr:`MEASURED` was characterized on-device
-    with the gyro rolling-shutter method. An unrecognized value → :attr:`UNKNOWN`.
+    :attr:`DOCUMENTED` is a declared default — from Apple's docs, from the pipeline,
+    or measured on a *reference* device; it is **not** a measurement on the phone you
+    are talking to. :attr:`MEASURED` was characterized on that device itself. An
+    unrecognized value → :attr:`UNKNOWN`.
+
+    :attr:`PTSConvention.READOUT_INSTANT` currently ships as :attr:`DOCUMENTED`
+    everywhere: it was measured on an iPhone 17 Pro, and one device's result is a
+    prior for the next rather than a reading of it.
     """
 
     UNKNOWN = 0
