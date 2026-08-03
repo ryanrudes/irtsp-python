@@ -57,6 +57,7 @@ __all__ = [
     "FocusMode",
     "ReadoutDirection",
     "PTSConvention",
+    "DirectionProvenance",
     "PTSProvenance",
     "ReadoutProvenance",
     "CameraFormat",
@@ -309,6 +310,28 @@ class PTSProvenance(IntEnum):
 
     UNKNOWN = 0
     DOCUMENTED = 1
+    MEASURED = 2
+
+
+class DirectionProvenance(IntEnum):
+    """How :attr:`CameraFormatRecord.readout_direction` was arrived at (revision 6).
+
+    Every other claim on the format record already carried its own provenance; the
+    direction did not, so a derivation and an observation were indistinguishable.
+
+    :attr:`DERIVED` — computed from the rotation the app applies to the delivered
+    buffer, assuming the sensor's native readout runs top→bottom. A good prior, and
+    the assumption is well supported, but it is still an assumption.
+    :attr:`MEASURED` — observed for *this* capture format by the app's own
+    rolling-shutter measurement, which recovers direction from banding and does not
+    rest on that assumption at all.
+
+    Producers before revision 6 wrote 0 into this reserved byte, so an older stream
+    decodes to :attr:`UNKNOWN` rather than claiming a derivation it never made.
+    """
+
+    UNKNOWN = 0
+    DERIVED = 1
     MEASURED = 2
 
 
@@ -813,6 +836,8 @@ class CameraFormat(Record):
     pts_convention: PTSConvention  #: what instant a frame's PTS denotes
     pts_provenance: PTSProvenance  #: how that convention was established
     readout_provenance: ReadoutProvenance  #: whether the readout time is a real prior
+    direction_provenance: DirectionProvenance = DirectionProvenance.UNKNOWN
+    """How :attr:`readout_direction` was arrived at (revision 6; ``UNKNOWN`` before it)."""
     binned: bool  #: sensor pixel binning is active
     cropped: bool  #: the delivered frame is a sensor crop
     #: True for a snapshot/keyframe (wire flags bit0): the current state

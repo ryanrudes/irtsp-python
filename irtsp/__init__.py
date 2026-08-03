@@ -57,6 +57,7 @@ from .records import (
     Intrinsics,
     Pose,
     PTSConvention,
+    DirectionProvenance,
     PTSProvenance,
     Quat,
     RawAccel,
@@ -79,7 +80,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .audio import AudioBlock, AudioStream, SenderReport
     from .discovery import Device
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
 # Names resolved lazily (PEP 562) so `import irtsp` stays dependency-free and
 # fast, while `irtsp.Device` / `irtsp.AsyncSession` still work at runtime.
@@ -147,6 +148,7 @@ __all__ = [
     "FocusMode",
     "ReadoutDirection",
     "PTSConvention",
+    "DirectionProvenance",
     "PTSProvenance",
     "ReadoutProvenance",
     "STANDARD_GRAVITY",
